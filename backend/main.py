@@ -81,6 +81,26 @@ CREATE INDEX IF NOT EXISTS shift_workers_worker ON shift_workers(worker_id, shif
 CREATE TABLE IF NOT EXISTS deleted_shifts (
     shift_id INTEGER PRIMARY KEY REFERENCES shifts(id)
 );
+CREATE TABLE IF NOT EXISTS shift_reports (
+    shift_id INTEGER NOT NULL REFERENCES shifts(id),
+    worker_id INTEGER NOT NULL REFERENCES accounts(id),
+    answers TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    issue TEXT NOT NULL,
+    machine_id INTEGER REFERENCES machines(id),
+    submitted_at TEXT,
+    late INTEGER NOT NULL DEFAULT 0 CHECK (late IN (0, 1)),
+    PRIMARY KEY (shift_id, worker_id)
+);
+CREATE TABLE IF NOT EXISTS report_resolutions (
+    shift_id INTEGER NOT NULL,
+    worker_id INTEGER NOT NULL,
+    manager_id INTEGER NOT NULL REFERENCES accounts(id),
+    note TEXT NOT NULL,
+    resolved_at TEXT NOT NULL,
+    PRIMARY KEY (shift_id, worker_id),
+    FOREIGN KEY (shift_id, worker_id) REFERENCES shift_reports(shift_id, worker_id)
+);
 """
 
 
@@ -469,17 +489,6 @@ def edit_machine(machine_id: int, data: MachineName, db: DB, account: Manager) -
             raise HTTPException(404, "Active machine not found.")
 
 
-@app.post("/api/machines/{machine_id}/archive", status_code=204)
-def archive_machine(machine_id: int, db: DB, account: Manager) -> None:
-    with db:
-        result = db.execute(
-            "UPDATE machines SET archived = 1 WHERE id = ? AND department_id = ?",
-            (machine_id, account.department_id),
-        )
-        if not result.rowcount:
-            raise HTTPException(404, "Machine not found.")
-
-
 @app.post("/api/machines/{machine_id}/updates", status_code=201)
 def record_machine_update(
     machine_id: int, data: MachineUpdateInput, db: DB, account: Worker,
@@ -565,12 +574,17 @@ class AssignedWorker(BaseModel):
     email: str
 
 
+ReportStatus = Literal["Pending", "Draft", "Submitted", "Late"]
+
+
 class Shift(BaseModel):
     id: int
     starts_at: datetime
     ends_at: datetime
     questions: list[Question]
     workers: list[AssignedWorker]
+    locked: bool = False
+    report_status: ReportStatus = "Pending"
 
 
 @app.get("/api/reporting-questions")
@@ -614,6 +628,7 @@ def save_assignments(
         saved_questions = []
         if existing_id is not None:
             existing = find_department_shift(existing_id, db, account)
+            require_unsubmitted_shift(existing)
             saved_questions = json.loads(existing["questions"])
         workers = {
             row["id"]: AssignedWorker.model_validate(dict(row))
@@ -666,6 +681,25 @@ def save_assignments(
                 "INSERT INTO shift_workers (shift_id, worker_id) VALUES (?, ?)",
                 [(shift_id, worker_id) for worker_id in data.worker_ids],
             )
+            if existing_id is not None:
+                db.execute(
+                    """DELETE FROM shift_reports WHERE shift_id = ? AND worker_id NOT IN
+                       (SELECT worker_id FROM shift_workers WHERE shift_id = ?)""",
+                    (shift_id, shift_id),
+                )
+                question_ids = {str(question.id) for question in questions}
+                drafts = db.execute(
+                    "SELECT worker_id, answers FROM shift_reports WHERE shift_id = ?", (shift_id,),
+                ).fetchall()
+                for draft in drafts:
+                    answers = {
+                        key: value for key, value in json.loads(draft["answers"]).items()
+                        if key in question_ids
+                    }
+                    db.execute(
+                        "UPDATE shift_reports SET answers = ? WHERE shift_id = ? AND worker_id = ?",
+                        (json.dumps(answers), shift_id, draft["worker_id"]),
+                    )
             shifts.append(Shift(
                 id=shift_id, starts_at=starts_at, ends_at=ends_at,
                 questions=questions, workers=assigned_workers,
@@ -685,13 +719,20 @@ def assign_shift_batch(data: ShiftBatch, db: DB, account: Manager) -> list[Shift
 
 def find_department_shift(shift_id: int, db: DB, account: Account) -> sqlite3.Row:
     row = db.execute(
-        """SELECT questions FROM shifts WHERE id = ? AND department_id = ?
+        """SELECT shifts.*, EXISTS (
+               SELECT 1 FROM shift_reports WHERE shift_id = shifts.id AND submitted_at IS NOT NULL
+           ) AS locked FROM shifts WHERE id = ? AND department_id = ?
            AND NOT EXISTS (SELECT 1 FROM deleted_shifts WHERE shift_id = shifts.id)""",
         (shift_id, account.department_id),
     ).fetchone()
     if row is None:
         raise HTTPException(404, "Shift not found.")
     return row
+
+
+def require_unsubmitted_shift(shift: sqlite3.Row) -> None:
+    if shift["locked"]:
+        raise HTTPException(409, "This shift is locked because a report has been submitted.")
 
 
 @app.patch("/api/shifts/{shift_id}")
@@ -703,16 +744,21 @@ def edit_shift(shift_id: int, data: NewShift, db: DB, account: Manager) -> Shift
 def delete_shift(shift_id: int, db: DB, account: Manager) -> None:
     with db:
         db.execute("BEGIN IMMEDIATE")
-        find_department_shift(shift_id, db, account)
+        require_unsubmitted_shift(find_department_shift(shift_id, db, account))
+        db.execute("DELETE FROM shift_reports WHERE shift_id = ?", (shift_id,))
         db.execute("INSERT INTO deleted_shifts (shift_id) VALUES (?)", (shift_id,))
 
 
 @app.get("/api/shifts")
 def list_shifts(db: DB, account: DepartmentStaff) -> list[Shift]:
     rows = db.execute(
-        """SELECT s.id, s.starts_at, s.ends_at, s.questions, a.id AS worker_id, a.email
+        """SELECT s.id, s.starts_at, s.ends_at, s.questions, a.id AS worker_id, a.email,
+                  EXISTS (SELECT 1 FROM shift_reports
+                          WHERE shift_id = s.id AND submitted_at IS NOT NULL) AS locked,
+                  r.shift_id AS report_id, r.submitted_at, r.late
            FROM shifts s JOIN shift_workers sw ON sw.shift_id = s.id
            JOIN accounts a ON a.id = sw.worker_id
+           LEFT JOIN shift_reports r ON r.shift_id = s.id AND r.worker_id = a.id
            WHERE s.department_id = ? AND (? OR sw.worker_id = ?)
              AND NOT EXISTS (SELECT 1 FROM deleted_shifts WHERE shift_id = s.id)
            ORDER BY s.starts_at DESC, s.id DESC, a.email""",
@@ -725,6 +771,273 @@ def list_shifts(db: DB, account: DepartmentStaff) -> list[Shift]:
             shifts[shift_id] = Shift(
                 id=shift_id, starts_at=row["starts_at"], ends_at=row["ends_at"],
                 questions=json.loads(row["questions"]), workers=[],
+                locked=bool(row["locked"]) if account.role == "manager" else False,
+                report_status=report_status(row) if account.role == "worker" else "Pending",
             )
         shifts[shift_id].workers.append(AssignedWorker(id=row["worker_id"], email=row["email"]))
     return list(shifts.values())
+
+
+ReportText = Annotated[str, StringConstraints(strip_whitespace=True, max_length=4000)]
+IssueText = Annotated[str, StringConstraints(strip_whitespace=True, max_length=2000)]
+
+
+class ReportInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    revision: str
+    answers: dict[int, ReportText]
+    summary: ReportText
+    issue: IssueText
+    machine_id: int | None = Field(default=None, gt=0)
+
+
+class ResolutionInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    note: Annotated[IssueText, StringConstraints(min_length=1)]
+
+
+def report_status(row: sqlite3.Row) -> ReportStatus:
+    if row["submitted_at"] is not None:
+        return "Late" if row["late"] else "Submitted"
+    return "Draft" if row["report_id"] is not None else "Pending"
+
+
+def shift_revision(shift: sqlite3.Row) -> str:
+    content = json.dumps([shift["starts_at"], shift["ends_at"], shift["questions"]])
+    return hashlib.sha256(content.encode()).hexdigest()
+
+
+def assigned_shift(shift_id: int, db: DB, worker: Worker) -> sqlite3.Row:
+    shift = find_department_shift(shift_id, db, worker)
+    if not db.execute(
+        "SELECT 1 FROM shift_workers WHERE shift_id = ? AND worker_id = ?", (shift_id, worker.id),
+    ).fetchone():
+        raise HTTPException(404, "Shift not found.")
+    return shift
+
+
+def report_content(db: DB, shift: sqlite3.Row, worker_id: int) -> dict:
+    report = db.execute(
+        """SELECT r.*, r.shift_id AS report_id, m.name AS machine_name,
+                  rr.note AS resolution_note, rr.resolved_at, a.email AS resolver
+           FROM shift_reports r LEFT JOIN machines m ON m.id = r.machine_id
+           LEFT JOIN report_resolutions rr USING (shift_id, worker_id)
+           LEFT JOIN accounts a ON a.id = rr.manager_id
+           WHERE r.shift_id = ? AND r.worker_id = ?""",
+        (shift["id"], worker_id),
+    ).fetchone()
+    return {
+        "shift_id": shift["id"],
+        "worker_id": worker_id,
+        "starts_at": shift["starts_at"],
+        "ends_at": shift["ends_at"],
+        "questions": json.loads(shift["questions"]),
+        "revision": shift_revision(shift),
+        "status": report_status(report) if report else "Pending",
+        "answers": json.loads(report["answers"]) if report else {},
+        "summary": report["summary"] if report else "",
+        "issue": report["issue"] if report else "",
+        "machine_id": report["machine_id"] if report else None,
+        "machine_name": report["machine_name"] if report else None,
+        "submitted_at": report["submitted_at"] if report else None,
+        "resolution": {
+            "note": report["resolution_note"],
+            "resolved_at": report["resolved_at"],
+            "manager_email": report["resolver"],
+        } if report and report["resolved_at"] else None,
+    }
+
+
+@app.get("/api/shifts/{shift_id}/report")
+def worker_report(shift_id: int, db: DB, worker: Worker) -> dict:
+    db.execute("BEGIN")
+    return report_content(db, assigned_shift(shift_id, db, worker), worker.id)
+
+
+def save_report(shift_id: int, data: ReportInput, db: DB, worker: Worker, *, submit: bool) -> dict:
+    now = datetime.now(UTC)
+    with db:
+        db.execute("BEGIN IMMEDIATE")
+        shift = assigned_shift(shift_id, db, worker)
+        existing = db.execute(
+            "SELECT submitted_at FROM shift_reports WHERE shift_id = ? AND worker_id = ?",
+            (shift_id, worker.id),
+        ).fetchone()
+        if existing and existing["submitted_at"] is not None:
+            raise HTTPException(409, "This report has already been submitted. Reload to view it.")
+        if data.revision != shift_revision(shift):
+            raise HTTPException(409, "This assignment changed. Reload the report before saving.")
+        questions = {question["id"]: question for question in json.loads(shift["questions"])}
+        if data.answers.keys() - questions.keys():
+            raise HTTPException(422, "Answers must match the questions assigned to this shift.")
+        if data.machine_id is not None:
+            if not data.issue:
+                raise HTTPException(422, "Describe the issue before linking a machine.")
+            if not db.execute(
+                "SELECT 1 FROM machines WHERE id = ? AND department_id = ? AND archived = 0",
+                (data.machine_id, worker.department_id),
+            ).fetchone():
+                raise HTTPException(422, "Select an active machine in your department.")
+        if submit:
+            if now < datetime.fromisoformat(shift["starts_at"]):
+                raise HTTPException(409, "You can submit this report once the shift starts.")
+            if any(question["required"] and not data.answers.get(key) for key, question in questions.items()):
+                raise HTTPException(422, "Answer all required questions before submitting.")
+        db.execute(
+            """INSERT INTO shift_reports
+               (shift_id, worker_id, answers, summary, issue, machine_id, submitted_at, late)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT (shift_id, worker_id) DO UPDATE SET
+                 answers = excluded.answers, summary = excluded.summary, issue = excluded.issue,
+                 machine_id = excluded.machine_id, submitted_at = excluded.submitted_at, late = excluded.late""",
+            (shift_id, worker.id, json.dumps(data.answers), data.summary, data.issue, data.machine_id,
+             now.isoformat() if submit else None, submit and now > datetime.fromisoformat(shift["ends_at"])),
+        )
+        return report_content(db, shift, worker.id)
+
+
+@app.put("/api/shifts/{shift_id}/report")
+def save_report_draft(shift_id: int, data: ReportInput, db: DB, worker: Worker) -> dict:
+    return save_report(shift_id, data, db, worker, submit=False)
+
+
+@app.post("/api/shifts/{shift_id}/report/submit")
+def submit_report(shift_id: int, data: ReportInput, db: DB, worker: Worker) -> dict:
+    return save_report(shift_id, data, db, worker, submit=True)
+
+
+def dashboard_department(db: DB, account: Account, department_id: int) -> Department:
+    if account.role == "worker" or (account.role == "manager" and account.department_id != department_id):
+        raise HTTPException(403, "Dashboard access is required for this department.")
+    row = db.execute("SELECT id, name FROM departments WHERE id = ?", (department_id,)).fetchone()
+    if row is None:
+        raise HTTPException(404, "Department not found.")
+    return Department.model_validate(dict(row))
+
+
+def submitted_report(db: DB, shift_id: int, worker_id: int) -> sqlite3.Row:
+    report = db.execute(
+        """SELECT s.*, r.issue, a.email AS worker_email FROM shift_reports r
+           JOIN shifts s ON s.id = r.shift_id JOIN accounts a ON a.id = r.worker_id
+           WHERE r.shift_id = ? AND r.worker_id = ? AND r.submitted_at IS NOT NULL""",
+        (shift_id, worker_id),
+    ).fetchone()
+    if report is None:
+        raise HTTPException(404, "Submitted report not found.")
+    return report
+
+
+@app.get("/api/departments/{department_id}/reports/{shift_id}/{worker_id}")
+def review_report(department_id: int, shift_id: int, worker_id: int, db: DB, account: SignedIn) -> dict:
+    db.execute("BEGIN")
+    dashboard_department(db, account, department_id)
+    shift = submitted_report(db, shift_id, worker_id)
+    if shift["department_id"] != department_id:
+        raise HTTPException(404, "Submitted report not found.")
+    return {**report_content(db, shift, worker_id), "worker_email": shift["worker_email"]}
+
+
+@app.post("/api/reports/{shift_id}/{worker_id}/resolve", status_code=204)
+def resolve_report_issue(shift_id: int, worker_id: int, data: ResolutionInput, db: DB, manager: Manager) -> None:
+    with db:
+        db.execute("BEGIN IMMEDIATE")
+        shift = submitted_report(db, shift_id, worker_id)
+        if shift["department_id"] != manager.department_id or not shift["issue"]:
+            raise HTTPException(404, "Report issue not found.")
+        result = db.execute(
+            """INSERT INTO report_resolutions (shift_id, worker_id, manager_id, note, resolved_at)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT (shift_id, worker_id) DO NOTHING""",
+            (shift_id, worker_id, manager.id, data.note, datetime.now(UTC).isoformat()),
+        )
+        if not result.rowcount:
+            raise HTTPException(409, "This report issue has already been resolved.")
+
+
+def department_metrics(db: DB, department_ids: list[int], now: datetime) -> dict[int, dict]:
+    metrics = {
+        department_id: {
+            "machines": {status: 0 for status in ("Working", "Not Working", "Has Issues", "Awaiting first update")},
+            "due": 0, "overdue": 0, "report_issues": 0,
+        }
+        for department_id in department_ids
+    }
+    if not metrics:
+        return metrics
+    scope = " = ?" if len(metrics) == 1 else " IS NOT NULL"
+    params = tuple(metrics) if len(metrics) == 1 else ()
+    for row in db.execute(
+        """SELECT m.department_id, COALESCE(u.status, 'Awaiting first update') AS status, COUNT(*) AS total
+           FROM machines m LEFT JOIN machine_updates u ON u.id = (
+             SELECT id FROM machine_updates WHERE machine_id = m.id ORDER BY id DESC LIMIT 1
+           ) WHERE m.archived = 0 AND m.department_id""" + scope + " GROUP BY m.department_id, status",
+        params,
+    ):
+        metrics[row["department_id"]]["machines"][row["status"]] = row["total"]
+    stamp = now.isoformat(timespec="microseconds")
+    for row in db.execute(
+        """SELECT s.department_id,
+                  SUM(r.submitted_at IS NULL AND s.starts_at <= ? AND s.ends_at >= ?) AS due,
+                  SUM(r.submitted_at IS NULL AND s.ends_at < ?) AS overdue,
+                  SUM(r.submitted_at IS NOT NULL AND r.issue != '' AND rr.shift_id IS NULL) AS report_issues
+           FROM shifts s JOIN shift_workers sw ON sw.shift_id = s.id
+           LEFT JOIN shift_reports r ON r.shift_id = s.id AND r.worker_id = sw.worker_id
+           LEFT JOIN report_resolutions rr ON rr.shift_id = r.shift_id AND rr.worker_id = r.worker_id
+           WHERE NOT EXISTS (SELECT 1 FROM deleted_shifts WHERE shift_id = s.id)
+           AND s.department_id""" + scope + " GROUP BY s.department_id",
+        (stamp, stamp, stamp, *params),
+    ):
+        metrics[row["department_id"]].update({key: row[key] for key in ("due", "overdue", "report_issues")})
+    return metrics
+
+
+@app.get("/api/dashboard")
+def plant_dashboard(db: DB, _: Owner) -> dict:
+    db.execute("BEGIN")
+    departments = db.execute("SELECT id, name FROM departments ORDER BY name").fetchall()
+    metrics = department_metrics(db, [row["id"] for row in departments], datetime.now(UTC))
+    return {"departments": [{**dict(row), "metrics": metrics[row["id"]]} for row in departments]}
+
+
+@app.get("/api/departments/{department_id}/dashboard")
+def department_dashboard(department_id: int, db: DB, account: SignedIn) -> dict:
+    db.execute("BEGIN")
+    department = dashboard_department(db, account, department_id)
+    now = datetime.now(UTC)
+    stamp = now.isoformat(timespec="microseconds")
+    machines = [
+        machine_from_row(row) for row in db.execute(
+            MACHINE_QUERY + " WHERE m.department_id = ? AND m.archived = 0 ORDER BY m.name, m.id",
+            (department_id,),
+        )
+    ]
+    activity = [
+        dict(row) for row in db.execute(
+            """SELECT s.id AS shift_id, s.starts_at, s.ends_at, a.id AS worker_id, a.email AS worker_email,
+                      r.submitted_at, COALESCE(r.late, 0) AS late,
+                      CASE
+                        WHEN r.submitted_at IS NOT NULL THEN 'Submitted'
+                        WHEN s.starts_at > ? THEN 'Upcoming'
+                        WHEN s.ends_at < ? THEN 'Overdue'
+                        ELSE 'Due'
+                      END AS status,
+                      CASE WHEN r.submitted_at IS NOT NULL AND rr.shift_id IS NULL THEN r.issue END AS open_issue,
+                      CASE WHEN r.submitted_at IS NOT NULL THEN m.name END AS machine_name
+               FROM shifts s JOIN shift_workers sw ON sw.shift_id = s.id
+               JOIN accounts a ON a.id = sw.worker_id
+               LEFT JOIN shift_reports r ON r.shift_id = s.id AND r.worker_id = sw.worker_id
+               LEFT JOIN report_resolutions rr ON rr.shift_id = r.shift_id AND rr.worker_id = r.worker_id
+               LEFT JOIN machines m ON m.id = r.machine_id
+               WHERE s.department_id = ? AND NOT EXISTS (
+                   SELECT 1 FROM deleted_shifts WHERE shift_id = s.id
+               ) ORDER BY s.starts_at, s.id, a.email""",
+            (stamp, stamp, department_id),
+        )
+    ]
+    return {
+        "department": department, "as_of": now,
+        "metrics": department_metrics(db, [department_id], now)[department_id],
+        "machines": machines, "activity": activity,
+    }

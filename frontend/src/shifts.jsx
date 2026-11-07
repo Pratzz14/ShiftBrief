@@ -1,5 +1,6 @@
-import { useEffect, useId, useRef, useState } from 'react';
-import { Form, LoadState, formatDate, useResource, write } from './ui';
+import { useId, useState } from 'react';
+import { Dialog, Form, LoadState, formatDate, useResource, write } from './ui';
+import { WorkerReport } from './reports';
 
 const localZone = new Intl.DateTimeFormat().resolvedOptions().timeZone;
 const weekdays = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
@@ -214,24 +215,6 @@ function AssignmentForm({ workers, questions, onAssign, shift }) {
   );
 }
 
-function ShiftDialog({ title, children, onDismiss }) {
-  const dialog = useRef(null);
-  const headingId = useId();
-
-  useEffect(() => {
-    if (!dialog.current.open) dialog.current.showModal();
-  }, []);
-
-  return (
-    <dialog ref={dialog} aria-labelledby={headingId} className="shift-dialog"
-      onCancel={(event) => { event.preventDefault(); onDismiss(); }}>
-      <h2 id={headingId}>{title}</h2>
-      {children}
-      <button type="button" className="secondary" onClick={onDismiss}>Cancel</button>
-    </dialog>
-  );
-}
-
 function ShiftList({ shifts, isManager, onAction }) {
   return (
     <section className="card">
@@ -255,10 +238,17 @@ function ShiftList({ shifts, isManager, onAction }) {
                   ))}
                 </ol>
               ) : <p>No reporting questions for this shift.</p>}
-              {isManager && (
+              {isManager ? shift.locked ? <p>Locked after report submission</p> : (
                 <div className="shift-actions">
                   <button type="button" className="secondary" onClick={() => onAction({ shift, action: 'edit' })}>Edit shift</button>
                   <button type="button" className="secondary" onClick={() => onAction({ shift, action: 'delete' })}>Delete shift</button>
+                </div>
+              ) : (
+                <div className="shift-actions">
+                  <button type="button" className="secondary" onClick={() => onAction({ shift, action: 'report' })}>
+                    {shift.report_status === 'Pending' ? 'Start report' : 'Open report'}
+                  </button>
+                  <small>{shift.report_status === 'Late' ? 'Submitted late' : shift.report_status}</small>
                 </div>
               )}
             </li>
@@ -315,7 +305,8 @@ export function ShiftPanel({ isManager, onExpired }) {
       )}
       {shifts.data ? <ShiftList shifts={shifts.data} isManager={isManager} onAction={setDialog} /> : <LoadState resource={shifts} label="shifts" />}
       {dialog && (
-        <ShiftDialog title={dialog.action === 'edit' ? 'Edit shift' : 'Delete shift'}
+        <Dialog title={{ edit: 'Edit shift', delete: 'Delete shift', report: 'Shift report' }[dialog.action]}
+          dismissLabel={dialog.action === 'report' ? 'Close report' : 'Cancel'}
           onDismiss={() => setDialog(null)}>
           {dialog.action === 'edit' ? (
             workers.data && questions.data ? (
@@ -331,6 +322,11 @@ export function ShiftPanel({ isManager, onExpired }) {
                   setNotice('Shift updated.');
                 }} />
             ) : <LoadState resource={!workers.data ? workers : questions} label="shift options" />
+          ) : dialog.action === 'report' ? (
+            <WorkerReport shiftId={dialog.shift.id} onExpired={onExpired} onSave={(report) => {
+              shifts.setData((current) => current.map((shift) => shift.id === report.shift_id
+                ? { ...shift, report_status: report.status } : shift));
+            }} />
           ) : (
             <Form label="Confirm delete" onSubmit={async () => {
               await write('/shifts/' + dialog.shift.id, 'DELETE', undefined, onExpired);
@@ -341,7 +337,7 @@ export function ShiftPanel({ isManager, onExpired }) {
               <p>Delete the shift from {formatDate(dialog.shift.starts_at)} to {formatDate(dialog.shift.ends_at)}?</p>
             </Form>
           )}
-        </ShiftDialog>
+        </Dialog>
       )}
     </>
   );

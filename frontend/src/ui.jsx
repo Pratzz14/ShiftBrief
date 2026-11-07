@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 
 export async function api(path, { method = 'GET', data, signal } = {}) {
   const response = await fetch('/api' + path, {
@@ -52,6 +52,23 @@ export function Form({ children, label, onSubmit, clear = false }) {
   );
 }
 
+export function Dialog({ title, children, onDismiss, dismissLabel = 'Close' }) {
+  const dialog = useRef(null);
+  const headingId = useId();
+
+  useEffect(() => {
+    if (!dialog.current.open) dialog.current.showModal();
+  }, []);
+
+  return (
+    <dialog ref={dialog} aria-labelledby={headingId} className="shift-dialog"
+      onCancel={(event) => { event.preventDefault(); onDismiss(); }}>
+      <h2 id={headingId}>{title}</h2>
+      {children}
+      <button type="button" className="secondary" onClick={onDismiss}>{dismissLabel}</button>
+    </dialog>
+  );
+}
 
 export function useResource(path, onExpired) {
   const [state, setState] = useState({ data: null, error: '' });

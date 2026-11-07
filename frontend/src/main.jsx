@@ -3,6 +3,7 @@ import { createRoot } from 'react-dom/client';
 import { api, Form } from './ui';
 import { MachinePanel } from './machines';
 import { ShiftPanel } from './shifts';
+import { DepartmentDashboard, PlantDashboard } from './dashboard';
 import './styles.css';
 
 const roles = { owner: 'Plant Owner', manager: 'Department Manager', worker: 'Worker' };
@@ -140,19 +141,28 @@ function AccessPanel({ account, onExpired }) {
 }
 
 function Workspace({ account, onExpired }) {
-  const [page, setPage] = useState('machines');
+  const [page, setPage] = useState(account.role === 'worker' ? 'machines' : 'dashboard');
   const isManager = account.role === 'manager';
-  const pages = [['machines', 'Machines'], ['shifts', isManager ? 'Shift assignments' : 'My Shifts']];
-  if (isManager) pages.push(['staff', 'Workers']);
+  const isOwner = account.role === 'owner';
+  const pages = isOwner
+    ? [['dashboard', 'Plant overview'], ['staff', 'Departments and managers']]
+    : [['machines', 'Machines'], ['shifts', isManager ? 'Shift assignments' : 'My Shifts']];
+  if (isManager) {
+    pages.unshift(['dashboard', 'Dashboard']);
+    pages.push(['staff', 'Workers']);
+  }
 
   return (
     <>
-      <nav className="workspace-nav" aria-label="Department workspace">
+      <nav className="workspace-nav" aria-label="Operations workspace">
         {pages.map(([id, label]) => (
           <button type="button" className="secondary" key={id}
             aria-current={page === id ? 'page' : undefined} onClick={() => setPage(id)}>{label}</button>
         ))}
       </nav>
+      {page === 'dashboard' && (isOwner
+        ? <PlantDashboard onExpired={onExpired} />
+        : <DepartmentDashboard departmentId={account.department_id} canResolve onExpired={onExpired} />)}
       {page === 'machines' && <MachinePanel isManager={isManager} onExpired={onExpired} />}
       {page === 'shifts' && <ShiftPanel isManager={isManager} onExpired={onExpired} />}
       {page === 'staff' && <AccessPanel account={account} onExpired={onExpired} />}
@@ -216,11 +226,7 @@ function App() {
         <button className="secondary" onClick={signOut}>Sign out</button>
       </header>
       {error && <p className="error" role="alert">{error}</p>}
-      {account.role === 'owner' ? (
-        <AccessPanel account={account} onExpired={expireSession} />
-      ) : (
-        <Workspace account={account} onExpired={expireSession} />
-      )}
+      <Workspace key={account.id} account={account} onExpired={expireSession} />
     </main>
   );
 

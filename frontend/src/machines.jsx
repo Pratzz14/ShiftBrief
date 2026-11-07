@@ -18,7 +18,6 @@ function MachineDetails({ id, isManager, onChange, onExpired }) {
       <h2>{machine.name}</h2>
       <p>{machine.archived ? 'Archived / ' : ''}{machine.latest?.status ?? 'Awaiting first update'}</p>
       {!machine.archived && (isManager ? (
-        <>
           <Form label="Save machine name" onSubmit={async ({ name }) => {
             await write('/machines/' + id, 'PATCH', { name }, onExpired);
             updateMachine({ name: name.trim() });
@@ -26,12 +25,6 @@ function MachineDetails({ id, isManager, onChange, onExpired }) {
           }}>
             <label>Machine name<input name="name" defaultValue={machine.name} maxLength={100} required /></label>
           </Form>
-          <Form label="Archive machine" onSubmit={async () => {
-            await write('/machines/' + id + '/archive', 'POST', undefined, onExpired);
-            updateMachine({ archived: true });
-            setNotice('Machine archived.');
-          }} />
-        </>
       ) : (
         <Form label="Record status" clear onSubmit={async (data) => {
           const entry = await write('/machines/' + id + '/updates', 'POST', data, onExpired);

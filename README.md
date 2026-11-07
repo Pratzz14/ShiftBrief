@@ -1,6 +1,6 @@
 # ShiftBrief
 
-ShiftBrief provides account setup, a department machine register, and manual shift assignments for one plant.
+ShiftBrief provides a machine register, shift assignments, worker reports, issue follow-up, and operations dashboards for one plant.
 
 ## Run locally
 
@@ -33,10 +33,13 @@ Open the [operations app](http://127.0.0.1:5173/app) to sign in or set up the pl
 
 ## Department operations
 
-- In **Machines**, managers can register, rename, and archive machines. Workers see active machines in their department and can record a status. A condition note is required for **Not Working** or **Has Issues**. Select a machine to see who updated it and when. Managers can still view the history of archived machines.
+- In **Machines**, managers can register and rename machines. Workers see active machines in their department and can record a status. A condition note is required for **Not Working** or **Has Issues**. Select a machine to see who updated it and when. Managers can still view the history of previously archived machines.
 - In **Shift assignments**, managers can add and edit reusable questions, then schedule a shift for one or more workers. Set each selected question as required or optional for that shift. Workers can view their assignments and saved questions under **My Shifts**. Later edits to the question library leave existing assignments intact.
 - Choose **Repeat weekly** to create individual shifts for selected weekdays in an inclusive date range of up to 366 days. An end time earlier than the start time creates an overnight shift. Each occurrence gets the same workers and reporting questions.
-- Use **Edit shift** or **Delete shift** on an individual scheduled shift, including a weekly occurrence. Deleting a shift removes it from the schedule and from workers' **My Shifts**.
+- Use **Edit shift** or **Delete shift** on an individual scheduled shift, including a weekly occurrence, until its first report is submitted.
+- In **My Shifts**, workers can save one draft per assigned shift, answer its reporting questions, summarize their activity, and flag an issue with an optional machine link. Submission opens at shift start and requires all mandatory answers. Submitted reports are read-only, with a late label for reports submitted after shift end.
+- The manager **Dashboard** shows machine status, upcoming shifts, outstanding reports, and recent submissions. In **Follow-up**, managers resolve report issues with a note. Machine faults remain visible until a worker records **Working**.
+- The owner **Plant overview** shows totals across departments and links to read-only department dashboards. Availability is the percentage of active machines marked **Working**. Machines awaiting their first status update have a separate count.
 - Shift times are entered and displayed in the browser's time zone and stored in UTC. Use the device time zone shown on the assignment form when entering a shift.
 
 Accounts and sessions persist in the local SQLite database at `backend/shiftbrief.sqlite3`. Set `SHIFTBRIEF_DB` before starting the API to use a different file. Sessions expire after eight hours and signing out revokes the current session.
