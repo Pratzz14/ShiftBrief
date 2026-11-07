@@ -1,7 +1,31 @@
 import { useState } from 'react';
 import { Form, LoadState, formatDate, useResource, write } from './ui';
 
-export function ReportDetails({ report }) {
+const analysisPending = (report) => report.analysis_state === 'pending';
+
+export function summaryText(summary, state) {
+  if (state === 'pending') return 'Preparing AI summary…';
+  if (state === 'disabled') return 'AI summaries are disabled on this server.';
+  if (state === 'ready') return 'An AI summary has not been generated for this report.';
+  if (state === 'unavailable') return 'AI analysis could not finish. The original report is still available.';
+  return summary || 'No summary available.';
+}
+
+export function ReportFindings({ findings, showEvidence = false }) {
+  if (!findings.length) return null;
+  return <>
+    <strong>AI findings</strong>
+    <ul>
+      {findings.map(({ description, excerpt }) => <li key={description}>
+        {description}
+        {showEvidence && <p className="note"><q>{excerpt}</q></p>}
+      </li>)}
+    </ul>
+  </>;
+}
+
+export function ReportDetails({ report, onAnalyze }) {
+  const canAnalyze = onAnalyze && ['ready', 'unavailable'].includes(report.analysis_state);
   return (
     <div className="report-details">
       {report.worker_email && <p>{report.worker_email}</p>}
@@ -18,13 +42,19 @@ export function ReportDetails({ report }) {
           ))}
         </dl>
       )}
-      <h3>Activity summary</h3>
-      <p className="note">{report.summary || 'No summary provided.'}</p>
-      {report.issue && (
+      {report.notes && <><h3>Worker notes</h3><p className="note">{report.notes}</p></>}
+      <h3>{report.analysis_state ? 'AI activity summary' : 'Activity summary'}</h3>
+      <p className="note" role="status">{summaryText(report.summary, report.analysis_state)}</p>
+      {canAnalyze && <Form label={report.analysis_state === 'ready' ? 'Generate AI summary' : 'Retry AI analysis'}
+        onSubmit={onAnalyze} />}
+      {(report.issue || report.ai_findings.length > 0) && (
         <>
-          <h3>Flagged issue</h3>
-          {report.machine_name && <p>Machine · {report.machine_name}</p>}
-          <p className="note">{report.issue}</p>
+          <h3>Report follow-up</h3>
+          {report.issue && <>
+            <strong>Worker flag{report.machine_name ? ' · ' + report.machine_name : ''}</strong>
+            <p className="note">{report.issue}</p>
+          </>}
+          <ReportFindings findings={report.ai_findings} showEvidence />
           {report.resolution ? (
             <>
               <p><strong>Resolved</strong> · {report.resolution.manager_email} · {formatDate(report.resolution.resolved_at)}</p>
@@ -63,7 +93,7 @@ function ReportEditor({ report, machines, onSave, onReload }) {
       await onSave({
         revision: report.revision,
         answers,
-        summary: fields.get('summary'),
+        notes: fields.get('notes'),
         issue: flagged ? fields.get('issue') : '',
         machine_id: flagged && fields.get('machine') ? Number(fields.get('machine')) : null,
       }, submit);
@@ -89,7 +119,7 @@ function ReportEditor({ report, machines, onSave, onReload }) {
             <textarea name={'question-' + id} maxLength={4000} defaultValue={report.answers[id]} />
           </label>
         ))}
-        <label>Activity summary (optional)<textarea name="summary" maxLength={4000} defaultValue={report.summary} /></label>
+        <label>Shift notes (optional)<textarea name="notes" maxLength={4000} defaultValue={report.notes} /></label>
         <label className="check-option">
           <input type="checkbox" checked={flagged} onChange={(event) => setFlagged(event.target.checked)} />
           Flag an issue
@@ -117,10 +147,14 @@ function ReportEditor({ report, machines, onSave, onReload }) {
 
 export function WorkerReport({ shiftId, onExpired, onSave }) {
   const path = '/shifts/' + shiftId + '/report';
-  const report = useResource(path, onExpired);
+  const report = useResource(path, onExpired, analysisPending);
   const machines = useResource('/machines', onExpired);
   if (!report.data) return <LoadState resource={report} label="report" />;
-  if (report.data.submitted_at) return <ReportDetails report={report.data} />;
+  if (report.data.submitted_at) return <ReportDetails report={report.data} onAnalyze={async () => {
+    const saved = await write(path + '/analyze', 'POST', undefined, onExpired);
+    report.setData(() => saved);
+    onSave(saved);
+  }} />;
   if (!machines.data) return <LoadState resource={machines} label="machines" />;
   return (
     <ReportEditor report={report.data} machines={machines.data} onReload={report.retry} onSave={async (data, submit) => {
@@ -131,14 +165,20 @@ export function WorkerReport({ shiftId, onExpired, onSave }) {
   );
 }
 
-export function ReviewReport({ departmentId, entry, canResolve, onExpired, onResolve }) {
+export function ReviewReport({ departmentId, entry, canResolve, onExpired, onResolve, onAnalysisQueued }) {
   const { shift_id, worker_id } = entry;
-  const report = useResource('/departments/' + departmentId + '/reports/' + shift_id + '/' + worker_id, onExpired);
+  const report = useResource('/departments/' + departmentId + '/reports/' + shift_id + '/' + worker_id,
+    onExpired, analysisPending);
   if (!report.data) return <LoadState resource={report} label="submitted report" />;
   return (
     <>
-      <ReportDetails report={report.data} />
-      {canResolve && report.data.issue && !report.data.resolution && (
+      <ReportDetails report={report.data} onAnalyze={canResolve ? async () => {
+        const saved = await write('/reports/' + shift_id + '/' + worker_id + '/analyze', 'POST', undefined, onExpired);
+        report.setData(() => saved);
+        onAnalysisQueued();
+      } : undefined} />
+      {canResolve && (report.data.issue || report.data.ai_findings.length > 0)
+        && !report.data.resolution && !analysisPending(report.data) && (
         <Form label="Resolve report issue" onSubmit={async ({ note }) => {
           await write('/reports/' + shift_id + '/' + worker_id + '/resolve', 'POST', { note }, onExpired);
           onResolve();

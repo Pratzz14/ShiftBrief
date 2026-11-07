@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import json
 import os
@@ -15,6 +16,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import AwareDatetime, BaseModel, ConfigDict, EmailStr, Field, StringConstraints, model_validator
+
+from . import automation
 
 DATABASE = Path(os.getenv("SHIFTBRIEF_DB", Path(__file__).with_name("shiftbrief.sqlite3")))
 FRONTEND = Path(__file__).resolve().parents[1] / "frontend" / "dist"
@@ -90,7 +93,10 @@ CREATE TABLE IF NOT EXISTS shift_reports (
     worker_id INTEGER NOT NULL REFERENCES accounts(id),
     answers TEXT NOT NULL,
     summary TEXT NOT NULL,
+    notes TEXT NOT NULL DEFAULT '',
     issue TEXT NOT NULL,
+    ai_findings TEXT NOT NULL DEFAULT '[]',
+    analysis_job_id INTEGER REFERENCES automation_jobs(id),
     machine_id INTEGER REFERENCES machines(id),
     submitted_at TEXT,
     late INTEGER NOT NULL DEFAULT 0 CHECK (late IN (0, 1)),
@@ -118,6 +124,7 @@ def connect() -> sqlite3.Connection:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     with closing(connect()) as connection:
+        connection.executescript(automation.SCHEMA)
         connection.executescript(SCHEMA)
         with connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -127,7 +134,38 @@ async def lifespan(_: FastAPI):
             shift_columns = connection.execute("PRAGMA table_info(shifts)").fetchall()
             if not any(column["name"] == "description" for column in shift_columns):
                 connection.execute("ALTER TABLE shifts ADD COLUMN description TEXT NOT NULL DEFAULT ''")
-    yield
+            report_columns = {column["name"] for column in connection.execute("PRAGMA table_info(shift_reports)")}
+            if "notes" not in report_columns:
+                connection.execute("ALTER TABLE shift_reports ADD COLUMN notes TEXT NOT NULL DEFAULT ''")
+                connection.execute("UPDATE shift_reports SET notes = summary, summary = '' WHERE submitted_at IS NULL")
+            if "ai_findings" not in report_columns:
+                connection.execute("ALTER TABLE shift_reports ADD COLUMN ai_findings TEXT NOT NULL DEFAULT '[]'")
+            if "analysis_job_id" not in report_columns:
+                connection.execute(
+                    "ALTER TABLE shift_reports ADD COLUMN analysis_job_id INTEGER REFERENCES automation_jobs(id)"
+                )
+            connection.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS shift_reports_analysis_job
+                   ON shift_reports(analysis_job_id) WHERE analysis_job_id IS NOT NULL"""
+            )
+            connection.execute(
+                """UPDATE automation_jobs SET state = 'unavailable', payload = '', claim = NULL
+                   WHERE kind = 'email' AND state = 'pending'"""
+            )
+            if not automation.ANALYSIS_ENABLED:
+                connection.execute(
+                    """UPDATE automation_jobs SET state = 'unavailable', payload = '', claim = NULL
+                       WHERE kind = 'analysis' AND state = 'pending'"""
+                )
+    tasks = []
+    if automation.ANALYSIS_ENABLED:
+        tasks.append(asyncio.create_task(automation.run_jobs(connect)))
+    try:
+        yield
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 app = FastAPI(title="ShiftBrief", lifespan=lifespan)
@@ -628,6 +666,7 @@ class Shift(BaseModel):
     locked: bool = False
     report_status: ReportStatus = "Pending"
     report_summary: str | None = None
+    report_analysis_state: Literal["pending", "complete", "unavailable"] | None = None
 
 
 @app.get("/api/reporting-questions")
@@ -800,10 +839,12 @@ def list_shifts(db: DB, account: DepartmentStaff) -> list[Shift]:
                   EXISTS (SELECT 1 FROM shift_reports
                           WHERE shift_id = s.id AND submitted_at IS NOT NULL) AS locked,
                   r.shift_id AS report_id, r.submitted_at, r.late,
-                  CASE WHEN r.submitted_at IS NOT NULL THEN r.summary END AS report_summary
+                  CASE WHEN r.submitted_at IS NOT NULL THEN r.summary END AS report_summary,
+                  j.state AS report_analysis_state
            FROM shifts s JOIN shift_workers sw ON sw.shift_id = s.id
            JOIN accounts a ON a.id = sw.worker_id
            LEFT JOIN shift_reports r ON r.shift_id = s.id AND r.worker_id = a.id
+           LEFT JOIN automation_jobs j ON j.id = r.analysis_job_id
            WHERE s.department_id = ? AND (? OR sw.worker_id = ?)
              AND NOT EXISTS (SELECT 1 FROM deleted_shifts WHERE shift_id = s.id)
            ORDER BY s.starts_at DESC, s.id DESC, a.email""",
@@ -819,6 +860,7 @@ def list_shifts(db: DB, account: DepartmentStaff) -> list[Shift]:
                 locked=bool(row["locked"]) if account.role == "manager" else False,
                 report_status=report_status(row) if account.role == "worker" else "Pending",
                 report_summary=row["report_summary"] if account.role == "worker" else None,
+                report_analysis_state=row["report_analysis_state"] if account.role == "worker" else None,
             )
         shifts[shift_id].workers.append(AssignedWorker(
             id=row["worker_id"], email=row["email"], display_name=row["display_name"],
@@ -835,7 +877,7 @@ class ReportInput(BaseModel):
 
     revision: str
     answers: dict[int, ReportText]
-    summary: ReportText
+    notes: ReportText = ""
     issue: IssueText
     machine_id: int | None = Field(default=None, gt=0)
 
@@ -866,16 +908,36 @@ def assigned_shift(shift_id: int, db: DB, worker: Worker) -> sqlite3.Row:
     return shift
 
 
+def report_analysis_payload(questions: list[dict], answers: dict[int, str], notes: str, issue: str) -> dict:
+    return {
+        "answers": [
+            {"question": question["prompt"], "answer": answers[question["id"]]}
+            for question in questions if answers.get(question["id"])
+        ],
+        "notes": notes,
+        "manual_flag": issue,
+    }
+
+
 def report_content(db: DB, shift: sqlite3.Row, worker_id: int) -> dict:
     report = db.execute(
         """SELECT r.*, r.shift_id AS report_id, m.name AS machine_name,
-                  rr.note AS resolution_note, rr.resolved_at, a.email AS resolver
+                  rr.note AS resolution_note, rr.resolved_at, a.email AS resolver, j.state AS analysis_state
            FROM shift_reports r LEFT JOIN machines m ON m.id = r.machine_id
            LEFT JOIN report_resolutions rr USING (shift_id, worker_id)
            LEFT JOIN accounts a ON a.id = rr.manager_id
+           LEFT JOIN automation_jobs j ON j.id = r.analysis_job_id
            WHERE r.shift_id = ? AND r.worker_id = ?""",
         (shift["id"], worker_id),
     ).fetchone()
+    answers = json.loads(report["answers"]) if report else {}
+    analysis_state = report["analysis_state"] if report else None
+    if (report and report["submitted_at"] and not report["summary"]
+            and (report["notes"] or report["issue"] or any(answers.values()))):
+        if not automation.ANALYSIS_ENABLED:
+            analysis_state = "disabled"
+        elif analysis_state is None:
+            analysis_state = "ready"
     return {
         "shift_id": shift["id"],
         "worker_id": worker_id,
@@ -885,8 +947,11 @@ def report_content(db: DB, shift: sqlite3.Row, worker_id: int) -> dict:
         "questions": json.loads(shift["questions"]),
         "revision": shift_revision(shift),
         "status": report_status(report) if report else "Pending",
-        "answers": json.loads(report["answers"]) if report else {},
+        "answers": answers,
         "summary": report["summary"] if report else "",
+        "notes": report["notes"] if report else "",
+        "analysis_state": analysis_state,
+        "ai_findings": json.loads(report["ai_findings"]) if report else [],
         "issue": report["issue"] if report else "",
         "machine_id": report["machine_id"] if report else None,
         "machine_name": report["machine_name"] if report else None,
@@ -903,6 +968,32 @@ def report_content(db: DB, shift: sqlite3.Row, worker_id: int) -> dict:
 def worker_report(shift_id: int, db: DB, worker: Worker) -> dict:
     db.execute("BEGIN")
     return report_content(db, assigned_shift(shift_id, db, worker), worker.id)
+
+
+def queue_missing_analysis(db: DB, shift: sqlite3.Row, worker_id: int) -> dict:
+    report = report_content(db, shift, worker_id)
+    if not report["submitted_at"]:
+        raise HTTPException(404, "Submitted report not found.")
+    if report["analysis_state"] == "disabled":
+        raise HTTPException(503, "AI summaries are disabled on this server.")
+    if report["analysis_state"] in {"ready", "unavailable"}:
+        job_id = automation.enqueue(db, report_analysis_payload(
+            report["questions"], {int(key): value for key, value in report["answers"].items()},
+            report["notes"], report["issue"],
+        ))
+        db.execute(
+            "UPDATE shift_reports SET analysis_job_id = ? WHERE shift_id = ? AND worker_id = ?",
+            (job_id, shift["id"], worker_id),
+        )
+        report["analysis_state"] = "pending"
+    return report
+
+
+@app.post("/api/shifts/{shift_id}/report/analyze")
+def analyze_worker_report(shift_id: int, db: DB, worker: Worker) -> dict:
+    with db:
+        db.execute("BEGIN IMMEDIATE")
+        return queue_missing_analysis(db, assigned_shift(shift_id, db, worker), worker.id)
 
 
 def save_report(shift_id: int, data: ReportInput, db: DB, worker: Worker, *, submit: bool) -> dict:
@@ -934,15 +1025,22 @@ def save_report(shift_id: int, data: ReportInput, db: DB, worker: Worker, *, sub
                 raise HTTPException(409, "You can submit this report once the shift starts.")
             if any(question["required"] and not data.answers.get(key) for key, question in questions.items()):
                 raise HTTPException(422, "Answer all required questions before submitting.")
+        analysis_job_id = None
+        if submit and automation.ANALYSIS_ENABLED and (data.notes or data.issue or any(data.answers.values())):
+            analysis_job_id = automation.enqueue(db, report_analysis_payload(
+                list(questions.values()), data.answers, data.notes, data.issue,
+            ))
         db.execute(
             """INSERT INTO shift_reports
-               (shift_id, worker_id, answers, summary, issue, machine_id, submitted_at, late)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               (shift_id, worker_id, answers, summary, notes, issue, machine_id, submitted_at, late, analysis_job_id)
+               VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, ?)
                ON CONFLICT (shift_id, worker_id) DO UPDATE SET
-                 answers = excluded.answers, summary = excluded.summary, issue = excluded.issue,
-                 machine_id = excluded.machine_id, submitted_at = excluded.submitted_at, late = excluded.late""",
-            (shift_id, worker.id, json.dumps(data.answers), data.summary, data.issue, data.machine_id,
-             now.isoformat() if submit else None, submit and now >= datetime.fromisoformat(shift["ends_at"])),
+                 answers = excluded.answers, notes = excluded.notes, issue = excluded.issue,
+                 machine_id = excluded.machine_id, submitted_at = excluded.submitted_at,
+                 late = excluded.late, analysis_job_id = excluded.analysis_job_id""",
+            (shift_id, worker.id, json.dumps(data.answers), data.notes, data.issue, data.machine_id,
+             now.isoformat() if submit else None, submit and now >= datetime.fromisoformat(shift["ends_at"]),
+             analysis_job_id),
         )
         return report_content(db, shift, worker.id)
 
@@ -968,8 +1066,9 @@ def dashboard_department(db: DB, account: Account, department_id: int) -> Depart
 
 def submitted_report(db: DB, shift_id: int, worker_id: int) -> sqlite3.Row:
     report = db.execute(
-        """SELECT s.*, r.issue, a.email AS worker_email FROM shift_reports r
+        """SELECT s.*, r.issue, r.ai_findings, j.state AS analysis_state, a.email AS worker_email FROM shift_reports r
            JOIN shifts s ON s.id = r.shift_id JOIN accounts a ON a.id = r.worker_id
+           LEFT JOIN automation_jobs j ON j.id = r.analysis_job_id
            WHERE r.shift_id = ? AND r.worker_id = ? AND r.submitted_at IS NOT NULL""",
         (shift_id, worker_id),
     ).fetchone()
@@ -988,13 +1087,25 @@ def review_report(department_id: int, shift_id: int, worker_id: int, db: DB, acc
     return {**report_content(db, shift, worker_id), "worker_email": shift["worker_email"]}
 
 
+@app.post("/api/reports/{shift_id}/{worker_id}/analyze")
+def analyze_department_report(shift_id: int, worker_id: int, db: DB, manager: Manager) -> dict:
+    with db:
+        db.execute("BEGIN IMMEDIATE")
+        shift = submitted_report(db, shift_id, worker_id)
+        if shift["department_id"] != manager.department_id:
+            raise HTTPException(404, "Submitted report not found.")
+        return {**queue_missing_analysis(db, shift, worker_id), "worker_email": shift["worker_email"]}
+
+
 @app.post("/api/reports/{shift_id}/{worker_id}/resolve", status_code=204)
 def resolve_report_issue(shift_id: int, worker_id: int, data: ResolutionInput, db: DB, manager: Manager) -> None:
     with db:
         db.execute("BEGIN IMMEDIATE")
         shift = submitted_report(db, shift_id, worker_id)
-        if shift["department_id"] != manager.department_id or not shift["issue"]:
+        if shift["department_id"] != manager.department_id or not (shift["issue"] or json.loads(shift["ai_findings"])):
             raise HTTPException(404, "Report issue not found.")
+        if shift["analysis_state"] == "pending":
+            raise HTTPException(409, "Wait for the report analysis to finish before resolving this issue.")
         result = db.execute(
             """INSERT INTO report_resolutions (shift_id, worker_id, manager_id, note, resolved_at)
                VALUES (?, ?, ?, ?, ?)
@@ -1030,7 +1141,8 @@ def department_metrics(db: DB, department_ids: list[int], now: datetime) -> dict
         """SELECT s.department_id,
                   SUM(r.submitted_at IS NULL AND s.starts_at <= ? AND s.ends_at > ?) AS due,
                   SUM(r.submitted_at IS NULL AND s.ends_at <= ?) AS overdue,
-                  SUM(r.submitted_at IS NOT NULL AND r.issue != '' AND rr.shift_id IS NULL) AS report_issues
+                  SUM(r.submitted_at IS NOT NULL AND (r.issue != '' OR r.ai_findings != '[]')
+                      AND rr.shift_id IS NULL) AS report_issues
            FROM shifts s JOIN shift_workers sw ON sw.shift_id = s.id
            LEFT JOIN shift_reports r ON r.shift_id = s.id AND r.worker_id = sw.worker_id
            LEFT JOIN report_resolutions rr ON rr.shift_id = r.shift_id AND rr.worker_id = r.worker_id
@@ -1111,6 +1223,7 @@ def department_dashboard(department_id: int, db: DB, account: SignedIn) -> dict:
                       COALESCE(a.display_name, a.email) AS worker_name,
                       r.submitted_at, COALESCE(r.late, 0) AS late,
                       CASE WHEN r.submitted_at IS NOT NULL THEN r.summary END AS summary,
+                      j.state AS analysis_state,
                       CASE
                         WHEN r.submitted_at IS NOT NULL THEN 'Submitted'
                         WHEN s.starts_at > ? THEN 'Upcoming'
@@ -1118,18 +1231,23 @@ def department_dashboard(department_id: int, db: DB, account: SignedIn) -> dict:
                         ELSE 'Due'
                       END AS status,
                       CASE WHEN r.submitted_at IS NOT NULL AND rr.shift_id IS NULL THEN r.issue END AS open_issue,
+                      CASE WHEN r.submitted_at IS NOT NULL AND rr.shift_id IS NULL THEN r.ai_findings
+                           ELSE '[]' END AS open_findings,
                       CASE WHEN r.submitted_at IS NOT NULL THEN m.name END AS machine_name
                FROM shifts s JOIN shift_workers sw ON sw.shift_id = s.id
                JOIN accounts a ON a.id = sw.worker_id
                LEFT JOIN shift_reports r ON r.shift_id = s.id AND r.worker_id = sw.worker_id
                LEFT JOIN report_resolutions rr ON rr.shift_id = r.shift_id AND rr.worker_id = r.worker_id
                LEFT JOIN machines m ON m.id = r.machine_id
+               LEFT JOIN automation_jobs j ON j.id = r.analysis_job_id
                WHERE s.department_id = ? AND NOT EXISTS (
                    SELECT 1 FROM deleted_shifts WHERE shift_id = s.id
                ) ORDER BY s.starts_at, s.id, a.email""",
             (stamp, stamp, department_id),
         )
     ]
+    for entry in activity:
+        entry["open_findings"] = json.loads(entry["open_findings"])
     return {
         "department": department, "as_of": now,
         "metrics": department_metrics(db, [department_id], now)[department_id],

@@ -73,7 +73,7 @@ export function Dialog({ title, children, onDismiss, dismissLabel = 'Close' }) {
   );
 }
 
-export function useResource(path, onExpired) {
+export function useResource(path, onExpired, pollWhile) {
   const [state, setState] = useState({ data: null, error: '' });
   const [attempt, setAttempt] = useState(0);
 
@@ -89,6 +89,30 @@ export function useResource(path, onExpired) {
     });
     return () => controller.abort();
   }, [path, onExpired, attempt]);
+
+  const polling = state.data != null && Boolean(pollWhile?.(state.data));
+  useEffect(() => {
+    if (!path || !polling) return;
+    const controller = new AbortController();
+    let timer;
+    async function refresh() {
+      try {
+        const data = await api(path, { signal: controller.signal });
+        if (!controller.signal.aborted) setState({ data, error: '' });
+      } catch (error) {
+        if (!controller.signal.aborted && error.status === 401) {
+          onExpired();
+          return;
+        }
+      }
+      if (!controller.signal.aborted) timer = setTimeout(refresh, 2500);
+    }
+    timer = setTimeout(refresh, 2500);
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [path, onExpired, attempt, polling]);
 
   return {
     ...state,

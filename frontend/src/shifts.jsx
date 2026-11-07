@@ -1,12 +1,13 @@
 import { useId, useState } from 'react';
 import { Dialog, Form, LoadState, formatDate, useResource, write } from './ui';
-import { WorkerReport } from './reports';
+import { WorkerReport, summaryText } from './reports';
 import { Badge, Empty, Icon, Metrics, PageTitle, ShiftWhen, Table } from './operations-ui';
 import { shiftWindow, useClock } from './shift-time';
 
 const localZone = new Intl.DateTimeFormat().resolvedOptions().timeZone;
 const weekdays = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 const dayMs = 24 * 60 * 60 * 1000;
+const pendingSummaries = (shifts) => shifts.some((shift) => shift.report_analysis_state === 'pending');
 
 function toTimestamp(value) {
   const date = new Date(value);
@@ -284,7 +285,8 @@ function WorkerShifts({ shifts, now, onAction }) {
         empty="Your completed assignments will appear here." render={(shift) => <tr role="row" key={shift.id}>
           <th scope="row" role="rowheader"><ShiftWhen shift={shift} /></th><td className="note" role="cell">{describe(shift)}</td>
           <td role="cell"><Badge>{reportLabel(shift)}</Badge>
-            {isSubmitted(shift) && <p className="note table-note">{shift.report_summary || 'No summary provided.'}</p>}</td>
+            {isSubmitted(shift) && <p className="note table-note">
+              {summaryText(shift.report_summary, shift.report_analysis_state)}</p>}</td>
           <td role="cell"><ReportAction shift={shift} onAction={onAction} primary={isOverdue(shift)} /></td>
         </tr>} />
     </section>
@@ -320,7 +322,7 @@ function Schedule({ shifts, onAction }) {
 }
 
 export function ShiftPanel({ isManager, initialAssign, onExpired }) {
-  const shifts = useResource('/shifts', onExpired);
+  const shifts = useResource('/shifts', onExpired, pendingSummaries);
   const workers = useResource(isManager ? '/staff' : null, onExpired);
   const questions = useResource(isManager ? '/reporting-questions' : null, onExpired);
   const [notice, setNotice] = useState('');
@@ -394,7 +396,8 @@ export function ShiftPanel({ isManager, initialAssign, onExpired }) {
           ) : dialog.action === 'report' ? (
             <WorkerReport shiftId={dialog.shift.id} onExpired={onExpired} onSave={(report) => {
               shifts.setData((current) => current.map((shift) => shift.id === report.shift_id
-                ? { ...shift, report_status: report.status, report_summary: report.submitted_at ? report.summary : null } : shift));
+                ? { ...shift, report_status: report.status, report_summary: report.submitted_at ? report.summary : null,
+                  report_analysis_state: report.analysis_state } : shift));
             }} />
           ) : (
             <Form label="Confirm delete" onSubmit={async () => {

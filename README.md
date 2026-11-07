@@ -20,7 +20,7 @@ npm install
 npm run dev
 ```
 
-Open the [public homepage](http://127.0.0.1:5173/) to see the product overview, features, and illustrative pricing. The homepage also runs with the API stopped.
+Open the [public homepage](http://127.0.0.1:5173/) to see the product overview, features, and per-plant pricing. The homepage also runs with the API stopped.
 
 Open the [operations app](http://127.0.0.1:5173/app) to sign in or set up the plant owner account. The Vite server proxies API requests to FastAPI on port 8000. When serving a production build, serve the frontend entry document at both `/` and `/app`.
 
@@ -46,8 +46,22 @@ Open [ShiftBrief operations](http://127.0.0.1:8000/app). The API serves the home
 - In **Shift assignments**, managers can schedule a shift for one or more workers and add a description with the planned work, checks, or handover instructions. Add or edit reusable reporting questions under **Manage reporting questions** and set each selected question as required or optional. Later edits to the question library leave existing assignments intact.
 - Choose **Repeat weekly** to create individual shifts for selected weekdays in an inclusive date range of up to 366 days. An end time earlier than the start time creates an overnight shift. Each occurrence gets the same workers and reporting questions.
 - Use **Edit shift** or **Delete shift** on an individual scheduled shift, including a weekly occurrence, until its first report is submitted.
-- In **My shifts**, workers can see all assignments that overlap today, the next shift, and completed shifts. A completed shift from earlier today appears in today's schedule and in history. Workers can save one draft per assigned shift, answer its reporting questions, summarize their activity, and flag an issue with an optional machine link. Submission opens at shift start and requires all mandatory answers. Submitted reports are read-only and marked late if submitted at or after the scheduled end.
-- **Department overview** shows today's shifts, per-worker reporting status, machine condition, and a searchable history with the assignment description alongside the submitted activity summary. Workers see this information in **Department handover**. Managers can close report issues with a resolution note in the **Follow-up queue**. Machine faults clear when a manager or worker records **Working**.
+- In **My shifts**, workers can see all assignments that overlap today, the next shift, and completed shifts. A completed shift from earlier today appears in today's schedule and in history. Workers can save one draft per assigned shift, answer its reporting questions, add optional shift notes, and manually flag an issue with an optional machine link. Submission opens at shift start and requires all mandatory answers. Submitted reports are read-only and marked late if submitted at or after the scheduled end.
+- **Department overview** shows today's shifts, per-worker reporting status, machine condition, and a searchable history with the assignment description alongside the submitted activity summary. Workers see this information in **Department handover**. Each active machine marked **Not Working** or **Has Issues** automatically appears as one open issue in the **Follow-up queue**. Further status updates keep the same machine issue open until a manager or worker records **Working**. Managers close report issues with a resolution note.
+
+## Report analysis
+
+- To enable AI analysis, set `SHIFTBRIEF_AI_ENABLED=1` and provide a server-side `GEMINI_API_KEY`. The default model is `gemini-3.1-flash-lite`. Set `SHIFTBRIEF_GEMINI_MODEL` to use a different Gemini model that supports structured output. Test with synthetic reports before enabling processing of plant data.
+- Gemini receives the submitted answers, their question prompts, optional notes, and any manual flag. It generates the activity summary and identifies problems that still need follow-up. A report has one follow-up item that combines its manual flag and any AI findings. Managers can close it with one resolution once analysis finishes. Reports and manual flags are saved immediately and remain available if analysis fails.
+- In local PowerShell, stop the API and restart it from the same terminal where you set the key. The prompt below hides the key as you enter it.
+
+  ```powershell
+  $env:SHIFTBRIEF_AI_ENABLED = '1'
+  $env:GEMINI_API_KEY = Read-Host 'Gemini API key' -MaskInput
+  .\.venv\Scripts\python.exe -m uvicorn backend.main:app --reload
+  ```
+
+- New reports with text are analyzed automatically when Gemini is enabled. For a report submitted while AI was disabled, open it and choose **Generate AI summary**. If a previous attempt failed, choose **Retry AI analysis**. The submitting worker or a manager in the same department can start this from the report view.
 - **Plant overview** compares departments and links to their read-only dashboards. The owner can browse department rosters and workers' scheduled shifts. The working machine count uses all active machines as its denominator.
 - Shift times are stored in UTC and entered and displayed in the browser's time zone. **Today** uses the browser's calendar day, including overnight shifts that overlap it. Use the device time zone shown on the assignment form when entering a shift. Use the refresh button for a new department or plant snapshot.
 

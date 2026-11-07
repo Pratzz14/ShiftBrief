@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Dialog, LoadState, formatDate, useResource } from './ui';
-import { ReviewReport } from './reports';
+import { ReportFindings, ReviewReport, summaryText } from './reports';
 import { Badge, Empty, Icon, Metrics, PageTitle, ShiftWhen, Table } from './operations-ui';
 import { shiftWindow } from './shift-time';
 
@@ -9,6 +9,7 @@ const unresolved = (metrics) => metrics.report_issues + metrics.machines['Not Wo
 const reportKey = (entry) => entry.shift_id + '/' + entry.worker_id;
 const machineCount = ({ machines }) => Object.values(machines).reduce((total, count) => total + count, 0);
 const reportLabel = (entry) => entry.late ? 'Submitted late' : entry.status;
+const pendingSummaries = ({ activity }) => activity.some((entry) => entry.analysis_state === 'pending');
 
 function groupShifts(activity, now) {
   const shifts = new Map();
@@ -42,8 +43,11 @@ function FollowUp({ issues, faults, onReview, onMachines }) {
     {showIssues && issues.length > 0 && <ul className="issue-list">
       {issues.map((entry) => <li key={reportKey(entry)}>
         <div className="issue-meta"><Badge>Worker report</Badge><small>{formatDate(entry.submitted_at)}</small></div>
-        <strong>{entry.worker_name}{entry.machine_name ? ' · ' + entry.machine_name : ''}</strong>
-        <p className="note">{entry.open_issue}</p>
+        <strong>{entry.worker_name}</strong>
+        {entry.open_issue && <p className="note">
+          {entry.machine_name ? entry.machine_name + ' · ' : ''}{entry.open_issue}
+        </p>}
+        <ReportFindings findings={entry.open_findings} />
         <button type="button" className="secondary compact" onClick={() => onReview(entry)}>Review report</button>
       </li>)}
     </ul>}
@@ -60,7 +64,7 @@ function FollowUp({ issues, faults, onReview, onMachines }) {
 }
 
 export function DepartmentDashboard({ departmentId, mode = 'manager', onExpired, onAssign, onMachines }) {
-  const dashboard = useResource('/departments/' + departmentId + '/dashboard', onExpired);
+  const dashboard = useResource('/departments/' + departmentId + '/dashboard', onExpired, pendingSummaries);
   const [selected, setSelected] = useState(null);
   const [query, setQuery] = useState('');
   if (!dashboard.data) return <LoadState resource={dashboard} label="department overview" />;
@@ -75,7 +79,7 @@ export function DepartmentDashboard({ departmentId, mode = 'manager', onExpired,
       .some((value) => value?.toLowerCase().includes(search)))
     .sort((a, b) => Date.parse(b.ends_at) - Date.parse(a.ends_at) || b.shift_id - a.shift_id);
   const faults = machines.filter(faulted);
-  const issues = activity.filter((entry) => entry.open_issue)
+  const issues = activity.filter((entry) => entry.open_issue || entry.open_findings.length > 0)
     .sort((a, b) => Date.parse(b.submitted_at) - Date.parse(a.submitted_at));
   const manager = mode === 'manager';
 
@@ -120,20 +124,26 @@ export function DepartmentDashboard({ departmentId, mode = 'manager', onExpired,
         render={(entry) => <tr key={reportKey(entry)}>
           <th scope="row"><ShiftWhen shift={entry} /><small>{entry.worker_name}</small></th>
           <td className="note">{entry.description || 'No shift description provided.'}</td>
-          <td>{entry.submitted_at ? <p className="note table-note">{entry.summary || 'No summary provided.'}</p>
+          <td>{entry.submitted_at ? <p className="note table-note">{summaryText(entry.summary, entry.analysis_state)}</p>
             : <Badge>Overdue</Badge>}</td>
           <td>{entry.submitted_at && <button className="secondary compact" type="button" onClick={() => setSelected(entry)}>Review</button>}</td>
         </tr>} />
     </section>
     {selected && <Dialog title="Report review" dismissLabel="Close report" onDismiss={() => setSelected(null)}>
-      <ReviewReport departmentId={departmentId} entry={selected} canResolve={manager} onExpired={onExpired} onResolve={() => {
-        dashboard.setData((current) => ({
+      <ReviewReport departmentId={departmentId} entry={selected} canResolve={manager} onExpired={onExpired}
+        onAnalysisQueued={() => dashboard.setData((current) => ({
           ...current,
-          metrics: { ...current.metrics, report_issues: Math.max(0, current.metrics.report_issues - 1) },
           activity: current.activity.map((entry) => reportKey(entry) === reportKey(selected)
-            ? { ...entry, open_issue: null } : entry),
-        }));
-      }} />
+            ? { ...entry, analysis_state: 'pending' } : entry),
+        }))}
+        onResolve={() => {
+          dashboard.setData((current) => ({
+            ...current,
+            metrics: { ...current.metrics, report_issues: Math.max(0, current.metrics.report_issues - 1) },
+            activity: current.activity.map((entry) => reportKey(entry) === reportKey(selected)
+              ? { ...entry, open_issue: null, open_findings: [] } : entry),
+          }));
+        }} />
     </Dialog>}
   </>;
 }

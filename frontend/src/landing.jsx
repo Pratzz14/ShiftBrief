@@ -41,6 +41,14 @@ function Navigation({ footer = false }) {
   );
 }
 
+function OpenAppLink({ compact = false }) {
+  return (
+    <a className={compact ? 'sb-button sb-header-app' : 'sb-button'} href="/app">
+      {compact ? 'Open app' : 'Open operations workspace'} <Icon name="arrow" />
+    </a>
+  );
+}
+
 function Wordmark() {
   return <a className="sb-wordmark" href="#home"><Icon name="factory" />ShiftBrief</a>;
 }
@@ -59,9 +67,49 @@ const planned = [
 ];
 
 const plans = [
-  { name: 'Pilot', description: 'For a team getting started at one site.', price: '€99', features: ['Machine register and status history', 'Shift assignments', 'Reusable reporting questions'] },
-  { name: 'Plant', description: 'For teams coordinating across a plant.', price: '€299', features: ['Everything in Pilot', 'AI-assisted handover reports', 'Multilingual summaries and escalations'] },
-  { name: 'Enterprise', description: 'For complex or multi-site operations.', price: 'Custom', features: ['Everything in Plant', 'Multi-site coordination', 'Robot and factory-system integrations'] },
+  {
+    name: 'Floor',
+    description: 'Get one department off paper handovers.',
+    price: '€79',
+    annualPrice: '€790',
+    setup: 'No setup fee',
+    features: [
+      '1 department · up to 15 workers',
+      'Shift scheduling and reporting questions',
+      'Machine condition and history',
+      'Shift reports, handovers and issue follow-up',
+      'AI analysis off',
+    ],
+  },
+  {
+    name: 'Plant',
+    description: 'Coordinate handovers across departments.',
+    price: '€249',
+    annualPrice: '€2,490',
+    setup: '€400 one-time setup on monthly billing',
+    recommended: true,
+    features: [
+      'All Floor tools · unlimited departments',
+      'Up to 80 workers',
+      'Plant overview and department drill-down',
+      'Optional AI: 400 report analyses per month, then €0.15 each',
+      'One setup call',
+    ],
+  },
+  {
+    name: 'Operations',
+    description: 'Cover more workers and reports at one plant.',
+    price: '€490',
+    annualPrice: '€4,900',
+    setup: '€400 one-time setup on monthly billing',
+    features: [
+      'All Plant tools · unlimited departments',
+      'Unlimited workers',
+      'Plant overview and department drill-down',
+      'Optional AI: 2,000 report analyses per month, then €0.12 each',
+      'Guided setup of your reporting questions',
+    ],
+  },
 ];
 
 function HandoverExample() {
@@ -75,7 +123,7 @@ function HandoverExample() {
       <dl>
         <div><dt>Issue</dt><dd>Filler 2 stopped after an infeed jam.</dd></div>
         <div><dt>Actions taken</dt><dd>Maintenance cleared the jam and logged the restart.</dd></div>
-        <div><dt>Next shift</dt><dd>Check for repeat stops and update the maintenance ticket.</dd></div>
+        <div><dt>Next shift</dt><dd>Check for repeat stops and record the outcome in the follow-up queue.</dd></div>
       </dl>
     </aside>
   );
@@ -86,7 +134,7 @@ function Features() {
     <section className="sb-section sb-wrap" id="features" aria-labelledby="features-title">
       <p className="sb-label">Features</p>
       <h2 id="features-title">From the floor to the next shift.</h2>
-      <p className="sb-intro">A preview of how ShiftBrief will turn floor updates into a handover the next crew can act on.</p>
+      <p className="sb-intro">Record what happened on the floor and give the next crew a clear handover.</p>
       <div className="sb-workflow">
         <ol className="sb-steps">
           {steps.map(({ title, icon, copy }, index) => (
@@ -124,22 +172,38 @@ function Pricing() {
   return (
     <section className="sb-section sb-pricing" id="pricing" aria-labelledby="pricing-title">
       <div className="sb-wrap">
-        <h2 id="pricing-title">Plans for every plant.</h2>
-        <p className="sb-intro">Example packages for a single team, an entire plant, or multiple sites.</p>
+        <p className="sb-label">Early access pricing</p>
+        <h2 id="pricing-title">One subscription per plant.</h2>
+        <p className="sb-intro">Start with one department or coordinate across the plant. Owners, managers and workers within your plan are included.</p>
         <div className="sb-price-note">
           <Icon name="info" />
-          <div><strong>Illustrative pricing</strong><p>These example packages include planned capabilities. Prices are for illustration only.</p></div>
+          <div>
+            <strong>Prepay for a year and get two months free</strong>
+            <p>Annual prices cover the platform for 12 months, with setup included. Extra AI usage is charged separately.</p>
+          </div>
         </div>
         <div className="sb-plans">
-          {plans.map(({ name, description, price, features }) => (
-            <article className={name === 'Plant' ? 'sb-plan sb-plan-highlight' : 'sb-plan'} key={name}>
-              <div className="sb-plan-head"><h3>{name}</h3><p>{description}</p></div>
+          {plans.map(({ name, description, price, annualPrice, setup, recommended, features }) => (
+            <article className={recommended ? 'sb-plan sb-plan-highlight' : 'sb-plan'} key={name}>
+              <div className="sb-plan-head">
+                <h3>{name}</h3>
+                {recommended ? <span className="sb-plan-badge">Recommended</span> : null}
+                <p>{description}</p>
+              </div>
               <div className="sb-plan-body">
-                <p className="sb-price"><strong>{price}</strong>{price !== 'Custom' && <span> / site / month</span>}</p>
+                <div className="sb-price">
+                  <p><strong>{price}</strong><span> / plant / month</span></p>
+                  <p className="sb-annual-price">{annualPrice} per plant, paid yearly</p>
+                  <p className="sb-setup-price">{setup}</p>
+                </div>
                 <ul>{features.map(feature => <li key={feature}><Icon name="check" />{feature}</li>)}</ul>
               </div>
             </article>
           ))}
+        </div>
+        <div className="sb-pricing-details">
+          <p><strong>AI is optional.</strong> When enabled, submitted questions, answers, notes and issue text are sent to Google Gemini. Crews can file reports and track issues with AI off.</p>
+          <p><strong>Each plant has its own workspace.</strong> A second plant uses a separate subscription. On-premises deployments are quoted separately.</p>
         </div>
       </div>
     </section>
@@ -157,13 +221,14 @@ function Landing() {
       <header className="sb-header sb-wrap">
         <Wordmark />
         <Navigation />
+        <OpenAppLink compact />
       </header>
       <main className="sb-main">
         <section className="sb-hero" aria-labelledby="home-title">
           <div className="sb-hero-copy">
             <h1 id="home-title">Every shift <span>starts informed.</span></h1>
             <p>ShiftBrief is built for industrial shift handovers. Give incoming crews a clear view of what happened, what’s still open, and what needs their attention.</p>
-            <a className="sb-button" href="/app">Open operations workspace <Icon name="arrow" /></a>
+            <OpenAppLink />
           </div>
           <img src="/shiftbrief-factory.webp" alt="Two factory workers reviewing a tablet on the production floor" width="1448" height="1086" fetchPriority="high" />
         </section>
