@@ -1,14 +1,15 @@
 import { useEffect, useId, useRef, useState } from 'react';
 
 export async function api(path, { method = 'GET', data, signal } = {}) {
+  const recording = data instanceof Blob;
   const response = await fetch('/api' + path, {
     method,
     signal,
     headers: {
       ...(method !== 'GET' && { 'X-ShiftBrief-Request': '1' }),
-      ...(data && { 'Content-Type': 'application/json' }),
+      ...(data && { 'Content-Type': recording ? data.type : 'application/json' }),
     },
-    body: data ? JSON.stringify(data) : undefined,
+    body: recording ? data : data ? JSON.stringify(data) : undefined,
   });
   if (response.status === 204) return null;
   if (!response.headers.get('content-type')?.includes('application/json')) {
@@ -55,7 +56,7 @@ export function Form({ children, label, onSubmit, clear = false }) {
   );
 }
 
-export function Dialog({ title, children, onDismiss, dismissLabel = 'Close' }) {
+export function Dialog({ title, children, onDismiss, dismissLabel = 'Close', dismissAtTop = false }) {
   const dialog = useRef(null);
   const headingId = useId();
 
@@ -63,12 +64,14 @@ export function Dialog({ title, children, onDismiss, dismissLabel = 'Close' }) {
     if (!dialog.current.open) dialog.current.showModal();
   }, []);
 
+  const heading = <h2 id={headingId}>{title}</h2>;
+  const dismiss = <button type="button" className="secondary" onClick={onDismiss}>{dismissLabel}</button>;
   return (
     <dialog ref={dialog} aria-labelledby={headingId} className="shift-dialog"
       onCancel={(event) => { event.preventDefault(); onDismiss(); }}>
-      <h2 id={headingId}>{title}</h2>
+      {dismissAtTop ? <header className="shift-dialog-header">{heading}{dismiss}</header> : heading}
       {children}
-      <button type="button" className="secondary" onClick={onDismiss}>{dismissLabel}</button>
+      {!dismissAtTop && dismiss}
     </dialog>
   );
 }

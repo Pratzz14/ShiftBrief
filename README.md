@@ -51,8 +51,10 @@ Open [ShiftBrief operations](http://127.0.0.1:8000/app). The API serves the home
 
 ## Report analysis
 
+- In **My shifts**, type one update or select **Record update**. Stop the recording and correct the transcript in the update box. **Generate draft** suggests answers for empty fields, asks about missing details, and highlights issues. Review and edit the results before submitting. Required questions still need answers. Open optional clarifications appear in the submitted report.
+- For dictation, set `SHIFTBRIEF_VOICE_ENABLED=1` and a server-side `ELEVENLABS_API_KEY`. The API reads the Git-ignored root `.env` at startup. Environment variables take precedence. Restart the API after changing these settings. Use HTTPS or localhost for microphone access. ShiftBrief sends recordings to ElevenLabs Scribe v2 and does not save audio. Review [ElevenLabs retention settings](https://elevenlabs.io/docs/api-reference/speech-to-text/convert) before enabling voice for plant data.
 - To enable AI analysis, set `SHIFTBRIEF_AI_ENABLED=1` and provide a server-side `GEMINI_API_KEY`. The default model is `gemini-3.1-flash-lite`. Set `SHIFTBRIEF_GEMINI_MODEL` to use a different Gemini model that supports structured output. Test with synthetic reports before enabling processing of plant data.
-- Gemini receives the submitted answers, their question prompts, optional notes, and any manual flag. It generates the activity summary and identifies problems that still need follow-up. A report has one follow-up item that combines its manual flag and any AI findings. Managers can close it with one resolution once analysis finishes. Reports and manual flags are saved immediately and remain available if analysis fails.
+- Gemini receives the shift update and assigned questions when a worker selects **Generate draft**. After submission it uses the confirmed answers, question prompts, notes, and any manual flag to summarize the shift and identify open problems. A report has one follow-up item that combines its manual flag and AI findings. Managers can close it with one resolution once analysis finishes. Reports and manual flags are saved immediately and remain available if analysis fails.
 - In local PowerShell, stop the API and restart it from the same terminal where you set the key. The prompt below hides the key as you enter it.
 
   ```powershell

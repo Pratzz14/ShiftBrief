@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import secrets
 import sqlite3
@@ -25,6 +26,9 @@ COOKIE_NAME = "shiftbrief_session"
 SESSION_SECONDS = 8 * 60 * 60
 SECURE_COOKIE = os.getenv("SHIFTBRIEF_SECURE_COOKIE") == "1"
 Role = Literal["owner", "manager", "worker"]
+MAX_UPDATE_LENGTH = 12000
+MAX_AUDIO_BYTES = 5 * 1024 * 1024
+logger = logging.getLogger(__name__)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS departments (
@@ -94,6 +98,8 @@ CREATE TABLE IF NOT EXISTS shift_reports (
     answers TEXT NOT NULL,
     summary TEXT NOT NULL,
     notes TEXT NOT NULL DEFAULT '',
+    worker_update TEXT NOT NULL DEFAULT '',
+    clarifications TEXT NOT NULL DEFAULT '{}',
     issue TEXT NOT NULL,
     ai_findings TEXT NOT NULL DEFAULT '[]',
     analysis_job_id INTEGER REFERENCES automation_jobs(id),
@@ -138,6 +144,10 @@ async def lifespan(_: FastAPI):
             if "notes" not in report_columns:
                 connection.execute("ALTER TABLE shift_reports ADD COLUMN notes TEXT NOT NULL DEFAULT ''")
                 connection.execute("UPDATE shift_reports SET notes = summary, summary = '' WHERE submitted_at IS NULL")
+            if "worker_update" not in report_columns:
+                connection.execute("ALTER TABLE shift_reports ADD COLUMN worker_update TEXT NOT NULL DEFAULT ''")
+            if "clarifications" not in report_columns:
+                connection.execute("ALTER TABLE shift_reports ADD COLUMN clarifications TEXT NOT NULL DEFAULT '{}'")
             if "ai_findings" not in report_columns:
                 connection.execute("ALTER TABLE shift_reports ADD COLUMN ai_findings TEXT NOT NULL DEFAULT '[]'")
             if "analysis_job_id" not in report_columns:
@@ -736,7 +746,9 @@ def save_assignments(
             Question(id=question.id, prompt=prompts[question.id], required=question.required)
             for question in data.questions
         ]
-        snapshot = json.dumps([question.model_dump() for question in questions])
+        question_data = [question.model_dump() for question in questions]
+        snapshot = json.dumps(question_data)
+        questions_changed = question_data != saved_questions
         assigned_workers = [workers[worker_id] for worker_id in data.worker_ids]
         for occurrence in occurrences:
             starts_at = occurrence.starts_at.astimezone(UTC)
@@ -780,8 +792,10 @@ def save_assignments(
                         if key in question_ids
                     }
                     db.execute(
-                        "UPDATE shift_reports SET answers = ? WHERE shift_id = ? AND worker_id = ?",
-                        (json.dumps(answers), shift_id, draft["worker_id"]),
+                        """UPDATE shift_reports SET answers = ?,
+                           clarifications = CASE WHEN ? THEN '{}' ELSE clarifications END
+                           WHERE shift_id = ? AND worker_id = ?""",
+                        (json.dumps(answers), questions_changed, shift_id, draft["worker_id"]),
                     )
             shifts.append(Shift(
                 id=shift_id, starts_at=starts_at, ends_at=ends_at,
@@ -870,6 +884,8 @@ def list_shifts(db: DB, account: DepartmentStaff) -> list[Shift]:
 
 ReportText = Annotated[str, StringConstraints(strip_whitespace=True, max_length=4000)]
 IssueText = Annotated[str, StringConstraints(strip_whitespace=True, max_length=2000)]
+WorkerUpdate = Annotated[str, StringConstraints(strip_whitespace=True, max_length=MAX_UPDATE_LENGTH)]
+Clarification = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=500)]
 
 
 class ReportInput(BaseModel):
@@ -880,6 +896,14 @@ class ReportInput(BaseModel):
     notes: ReportText = ""
     issue: IssueText
     machine_id: int | None = Field(default=None, gt=0)
+    worker_update: WorkerUpdate | None = None
+    clarifications: dict[int, Clarification] | None = Field(default=None, max_length=50)
+
+
+class GenerateDraftInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    revision: str
+    worker_update: Annotated[WorkerUpdate, StringConstraints(min_length=1)]
 
 
 class ResolutionInput(BaseModel):
@@ -906,6 +930,19 @@ def assigned_shift(shift_id: int, db: DB, worker: Worker) -> sqlite3.Row:
     ).fetchone():
         raise HTTPException(404, "Shift not found.")
     return shift
+
+
+def editable_report(shift_id: int, revision: str, db: DB, worker: Worker) -> tuple[sqlite3.Row, sqlite3.Row | None]:
+    shift = assigned_shift(shift_id, db, worker)
+    report = db.execute(
+        "SELECT submitted_at, worker_update, clarifications FROM shift_reports WHERE shift_id = ? AND worker_id = ?",
+        (shift_id, worker.id),
+    ).fetchone()
+    if report and report["submitted_at"] is not None:
+        raise HTTPException(409, "This report has already been submitted. Reload to view it.")
+    if revision != shift_revision(shift):
+        raise HTTPException(409, "This assignment changed. Reload the report before continuing.")
+    return shift, report
 
 
 def report_analysis_payload(questions: list[dict], answers: dict[int, str], notes: str, issue: str) -> dict:
@@ -948,6 +985,8 @@ def report_content(db: DB, shift: sqlite3.Row, worker_id: int) -> dict:
         "revision": shift_revision(shift),
         "status": report_status(report) if report else "Pending",
         "answers": answers,
+        "worker_update": report["worker_update"] if report else "",
+        "clarifications": json.loads(report["clarifications"]) if report else {},
         "summary": report["summary"] if report else "",
         "notes": report["notes"] if report else "",
         "analysis_state": analysis_state,
@@ -967,7 +1006,54 @@ def report_content(db: DB, shift: sqlite3.Row, worker_id: int) -> dict:
 @app.get("/api/shifts/{shift_id}/report")
 def worker_report(shift_id: int, db: DB, worker: Worker) -> dict:
     db.execute("BEGIN")
-    return report_content(db, assigned_shift(shift_id, db, worker), worker.id)
+    return {
+        **report_content(db, assigned_shift(shift_id, db, worker), worker.id),
+        "draft_generation_enabled": automation.ANALYSIS_ENABLED,
+        "voice_enabled": automation.VOICE_ENABLED,
+    }
+
+
+@app.post("/api/shifts/{shift_id}/report/generate-draft")
+def generate_worker_draft(shift_id: int, data: GenerateDraftInput, db: DB, worker: Worker) -> dict:
+    shift, _ = editable_report(shift_id, data.revision, db, worker)
+    if not automation.ANALYSIS_ENABLED:
+        raise HTTPException(503, "AI draft generation is disabled. You can enter answers manually.")
+    try:
+        draft = automation.generate_draft(data.worker_update, json.loads(shift["questions"]))
+    except Exception as error:
+        logger.warning("Shift report draft generation failed (%s)", type(error).__name__)
+        raise HTTPException(502, "Could not generate a draft. Try again or enter answers manually.") from None
+    editable_report(shift_id, data.revision, db, worker)
+    return draft
+
+
+@app.post("/api/shifts/{shift_id}/report/transcribe")
+async def transcribe_worker_update(shift_id: int, revision: str, request: Request, db: DB, worker: Worker) -> dict:
+    editable_report(shift_id, revision, db, worker)
+    if not automation.VOICE_ENABLED:
+        raise HTTPException(503, "Voice input is disabled. You can type your shift update.")
+    media_type = request.headers.get("content-type", "").partition(";")[0].strip().lower()
+    if media_type not in automation.AUDIO_EXTENSIONS:
+        raise HTTPException(415, "Unsupported recording format. You can type your shift update.")
+    audio = bytearray()
+    async for chunk in request.stream():
+        if len(audio) + len(chunk) > MAX_AUDIO_BYTES:
+            raise HTTPException(413, "Recording is too large. Record a shorter update.")
+        audio.extend(chunk)
+    if not audio:
+        raise HTTPException(422, "The recording is empty.")
+    editable_report(shift_id, revision, db, worker)
+    try:
+        transcript = await asyncio.to_thread(automation.transcribe_audio, bytes(audio), media_type)
+    except Exception as error:
+        logger.warning("Shift report transcription failed (%s)", type(error).__name__)
+        raise HTTPException(502, "Could not transcribe the recording. Retry or type your shift update.") from None
+    editable_report(shift_id, revision, db, worker)
+    if not transcript:
+        raise HTTPException(422, "No speech was detected. Record again or type your update.")
+    if len(transcript) > MAX_UPDATE_LENGTH:
+        raise HTTPException(422, "Transcript is too long. Record a shorter update.")
+    return {"text": transcript}
 
 
 def queue_missing_analysis(db: DB, shift: sqlite3.Row, worker_id: int) -> dict:
@@ -1000,18 +1086,20 @@ def save_report(shift_id: int, data: ReportInput, db: DB, worker: Worker, *, sub
     now = datetime.now(UTC)
     with db:
         db.execute("BEGIN IMMEDIATE")
-        shift = assigned_shift(shift_id, db, worker)
-        existing = db.execute(
-            "SELECT submitted_at FROM shift_reports WHERE shift_id = ? AND worker_id = ?",
-            (shift_id, worker.id),
-        ).fetchone()
-        if existing and existing["submitted_at"] is not None:
-            raise HTTPException(409, "This report has already been submitted. Reload to view it.")
-        if data.revision != shift_revision(shift):
-            raise HTTPException(409, "This assignment changed. Reload the report before saving.")
+        shift, existing = editable_report(shift_id, data.revision, db, worker)
         questions = {question["id"]: question for question in json.loads(shift["questions"])}
         if data.answers.keys() - questions.keys():
             raise HTTPException(422, "Answers must match the questions assigned to this shift.")
+        clarifications = data.clarifications
+        if clarifications is None:
+            stored = json.loads(existing["clarifications"]) if existing else {}
+            clarifications = {int(key): value for key, value in stored.items()}
+        if clarifications.keys() - questions.keys():
+            raise HTTPException(422, "Clarifications must match the questions assigned to this shift.")
+        clarifications = {key: value for key, value in clarifications.items() if not data.answers.get(key)}
+        worker_update = data.worker_update
+        if worker_update is None:
+            worker_update = existing["worker_update"] if existing else ""
         if data.machine_id is not None:
             if not data.issue:
                 raise HTTPException(422, "Describe the issue before linking a machine.")
@@ -1032,13 +1120,16 @@ def save_report(shift_id: int, data: ReportInput, db: DB, worker: Worker, *, sub
             ))
         db.execute(
             """INSERT INTO shift_reports
-               (shift_id, worker_id, answers, summary, notes, issue, machine_id, submitted_at, late, analysis_job_id)
-               VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, ?)
+               (shift_id, worker_id, answers, summary, notes, worker_update, clarifications,
+                issue, machine_id, submitted_at, late, analysis_job_id)
+               VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT (shift_id, worker_id) DO UPDATE SET
-                 answers = excluded.answers, notes = excluded.notes, issue = excluded.issue,
+                 answers = excluded.answers, notes = excluded.notes, worker_update = excluded.worker_update,
+                 clarifications = excluded.clarifications, issue = excluded.issue,
                  machine_id = excluded.machine_id, submitted_at = excluded.submitted_at,
                  late = excluded.late, analysis_job_id = excluded.analysis_job_id""",
-            (shift_id, worker.id, json.dumps(data.answers), data.notes, data.issue, data.machine_id,
+            (shift_id, worker.id, json.dumps(data.answers), data.notes, worker_update, json.dumps(clarifications),
+             data.issue, data.machine_id,
              now.isoformat() if submit else None, submit and now >= datetime.fromisoformat(shift["ends_at"]),
              analysis_job_id),
         )

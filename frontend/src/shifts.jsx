@@ -374,6 +374,7 @@ export function ShiftPanel({ isManager, initialAssign, onExpired }) {
       {dialog && (
         <Dialog title={{ assign: 'Assign a shift', edit: 'Edit shift', delete: 'Delete shift', report: 'Shift report' }[dialog.action]}
           dismissLabel={dialog.action === 'report' ? 'Close report' : 'Cancel'}
+          dismissAtTop={dialog.action === 'report'}
           onDismiss={() => setDialog(null)}>
           {dialog.action === 'assign' ? (
             workers.data && questions.data && shifts.data

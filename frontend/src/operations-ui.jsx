@@ -6,6 +6,8 @@ const paths = {
   overview: 'M3 3h7v7H3zM14 3h7v7h-7zM3 14h7v7H3zM14 14h7v7h-7z',
   shifts: 'M4 6h16v15H4zM8 3v6m8-6v6M4 11h16',
   report: 'M6 3h9l4 4v14H6zM9 12h7m-7 4h7',
+  mic: 'M12 2a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3ZM5 10v1a7 7 0 0 0 14 0v-1m-7 8v4m-4 0h8',
+  stop: 'M6 6h12v12H6z',
   machines: 'M3 21V10l6 3V9l6 3 1-9h4l1 18zM6 17h2m3 0h2m3 0h2',
   staff: 'M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2m20 0v-2a4 4 0 0 0-3-4M13 7a4 4 0 1 1-8 0 4 4 0 0 1 8 0Zm4-4a4 4 0 0 1 0 8',
   exit: 'M10 3H4v18h6m4-14 5 5-5 5m-5-5h10',
