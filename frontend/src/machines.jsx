@@ -8,27 +8,30 @@ function MachineDetails({ id, isManager, onChange, onExpired }) {
   const machine = history.data;
   if (!machine) return <LoadState resource={history} label="machine history" />;
 
-  function updateMachine(changes) {
-    history.setData((current) => ({ ...current, ...changes }));
-    onChange(changes);
-  }
-
   return (
     <section className="card">
       <h2>{machine.name}</h2>
-      <p>{machine.archived ? 'Archived / ' : ''}{machine.latest?.status ?? 'Awaiting first update'}</p>
-      {!machine.archived && (isManager ? (
-          <Form label="Save machine name" onSubmit={async ({ name }) => {
-            await write('/machines/' + id, 'PATCH', { name }, onExpired);
-            updateMachine({ name: name.trim() });
-            setNotice('Machine name saved.');
-          }}>
-            <label>Machine name<input name="name" defaultValue={machine.name} maxLength={100} required /></label>
-          </Form>
-      ) : (
+      <p>{machine.archived ? 'Archived / ' : ''}{machine.status}</p>
+      {!machine.archived && isManager && (
+        <Form label="Save machine name" onSubmit={async ({ name }) => {
+          await write('/machines/' + id, 'PATCH', { name }, onExpired);
+          history.setData((current) => ({ ...current, name: name.trim() }));
+          onChange((current) => ({ ...current, name: name.trim() }));
+          setNotice('Machine name saved.');
+        }}>
+          <label>Machine name<input name="name" defaultValue={machine.name} maxLength={100} required /></label>
+        </Form>
+      )}
+      {!machine.archived && (
         <Form label="Record status" clear onSubmit={async (data) => {
           const entry = await write('/machines/' + id + '/updates', 'POST', data, onExpired);
-          updateMachine({ latest: entry, updates: [entry, ...machine.updates] });
+          history.setData((current) => ({
+            ...current, status: entry.status, latest: entry, updates: [entry, ...current.updates],
+          }));
+          onChange((current) => ({
+            ...current, status: entry.status, latest: entry,
+            recent_updates: [entry, ...current.recent_updates].slice(0, 3),
+          }));
           setStatus('Working');
           setNotice('Machine status recorded.');
         }}>
@@ -42,7 +45,7 @@ function MachineDetails({ id, isManager, onChange, onExpired }) {
             <textarea name="note" maxLength={2000} required={status !== 'Working'} />
           </label>
         </Form>
-      ))}
+      )}
       {notice && <p role="status">{notice}</p>}
       <h3>Status history</h3>
       {machine.updates.length ? (
@@ -60,9 +63,9 @@ function MachineDetails({ id, isManager, onChange, onExpired }) {
   );
 }
 
-export function MachinePanel({ isManager, onExpired }) {
+export function MachinePanel({ isManager, initialMachine = null, onExpired }) {
   const machines = useResource('/machines', onExpired);
-  const [selected, setSelected] = useState(null);
+  const [selected, setSelected] = useState(initialMachine);
   const [notice, setNotice] = useState('');
   if (!machines.data) return <LoadState resource={machines} label="machines" />;
 
@@ -70,6 +73,7 @@ export function MachinePanel({ isManager, onExpired }) {
     <div className="panels">
       <section className="card">
         <h2>Department machines</h2>
+        {!isManager && <p>Select a machine to report an issue or update its condition.</p>}
         {isManager && (
           <Form label="Register machine" clear onSubmit={async (data) => {
             const machine = await write('/machines', 'POST', data, onExpired);
@@ -88,8 +92,21 @@ export function MachinePanel({ isManager, onExpired }) {
                 <button type="button" className="secondary record-button" aria-pressed={selected === machine.id}
                   onClick={() => { setSelected(machine.id); setNotice(''); }}>
                   {machine.name}
-                  <small>{machine.archived ? 'Archived / ' : ''}{machine.latest?.status ?? 'Awaiting first update'}</small>
+                  <small>{machine.archived ? 'Archived / ' : ''}{machine.status}</small>
                 </button>
+                {machine.recent_updates.length > 0 && (
+                  <div className="machine-recent">
+                    <strong>Recent status changes</strong>
+                    <ul>
+                      {machine.recent_updates.map((entry) => (
+                        <li key={entry.id}>
+                          <span>{entry.status}</span>
+                          <time dateTime={entry.recorded_at}>{formatDate(entry.recorded_at)}</time>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
               </li>
             ))}
           </ul>
@@ -97,8 +114,8 @@ export function MachinePanel({ isManager, onExpired }) {
       </section>
       {selected !== null && (
         <MachineDetails key={selected} id={selected} isManager={isManager} onExpired={onExpired}
-          onChange={(changes) => machines.setData((current) => current.map(
-            (machine) => machine.id === selected ? { ...machine, ...changes } : machine,
+          onChange={(update) => machines.setData((current) => current.map(
+            (machine) => machine.id === selected ? update(machine) : machine,
           ))} />
       )}
     </div>

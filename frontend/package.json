@@ -4,7 +4,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
-    "build": "vite build"
+    "build": "vite build",
+    "test": "node --test src/shift-time.test.js"
   },
   "dependencies": {
     "react": "19.2.8",

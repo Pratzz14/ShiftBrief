@@ -11,6 +11,9 @@ export async function api(path, { method = 'GET', data, signal } = {}) {
     body: data ? JSON.stringify(data) : undefined,
   });
   if (response.status === 204) return null;
+  if (!response.headers.get('content-type')?.includes('application/json')) {
+    throw Object.assign(new Error('The operations API is unavailable. Try again in a moment.'), { status: response.status });
+  }
   const body = await response.json();
   if (!response.ok) {
     const message = Array.isArray(body.detail)

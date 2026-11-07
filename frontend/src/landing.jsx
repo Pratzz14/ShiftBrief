@@ -163,7 +163,7 @@ function Landing() {
           <div className="sb-hero-copy">
             <h1 id="home-title">Every shift <span>starts informed.</span></h1>
             <p>ShiftBrief is built for industrial shift handovers. Give incoming crews a clear view of what happened, what’s still open, and what needs their attention.</p>
-            <a className="sb-button" href="#features">Explore features <Icon name="arrow" /></a>
+            <a className="sb-button" href="/app">Open operations workspace <Icon name="arrow" /></a>
           </div>
           <img src="/shiftbrief-factory.webp" alt="Two factory workers reviewing a tablet on the production floor" width="1448" height="1086" fetchPriority="high" />
         </section>

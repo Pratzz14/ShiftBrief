@@ -4,7 +4,9 @@ import { api, Form } from './ui';
 import { MachinePanel } from './machines';
 import { ShiftPanel } from './shifts';
 import { DepartmentDashboard, PlantDashboard } from './dashboard';
+import { Icon, PageTitle } from './operations-ui';
 import './styles.css';
+import './operations.css';
 
 const roles = { owner: 'Plant Owner', manager: 'Department Manager', worker: 'Worker' };
 
@@ -110,6 +112,9 @@ function AccessPanel({ account, onExpired }) {
               setNotice('Account created for ' + member.email + '.');
             }}>
               <Credentials creating />
+              <label>Full name (optional)
+                <input name="display_name" autoComplete="off" maxLength={100} />
+              </label>
               {isOwner && (
                 <div className="field">
                   <label htmlFor="manager-department">Department</label>
@@ -131,7 +136,8 @@ function AccessPanel({ account, onExpired }) {
         {staff.length ? (
           <ul className="staff-list">
             {staff.map((member) => (
-              <li key={member.id}>{member.email} <small>{member.department_name}</small></li>
+              <li key={member.id}><strong>{member.display_name || member.email}</strong>
+                <small>{[member.display_name && member.email, member.department_name].filter(Boolean).join(' · ')}</small></li>
             ))}
           </ul>
         ) : <p>No {accountType}s have been added yet.</p>}
@@ -140,33 +146,60 @@ function AccessPanel({ account, onExpired }) {
   );
 }
 
-function Workspace({ account, onExpired }) {
-  const [page, setPage] = useState(account.role === 'worker' ? 'machines' : 'dashboard');
+function Workspace({ account, onExpired, onSignOut, error, signingOut }) {
   const isManager = account.role === 'manager';
   const isOwner = account.role === 'owner';
+  const [view, setView] = useState({ page: account.role === 'worker' ? 'shifts' : 'dashboard' });
+  const { page } = view;
   const pages = isOwner
-    ? [['dashboard', 'Plant overview'], ['staff', 'Departments and managers']]
-    : [['machines', 'Machines'], ['shifts', isManager ? 'Shift assignments' : 'My Shifts']];
-  if (isManager) {
-    pages.unshift(['dashboard', 'Dashboard']);
-    pages.push(['staff', 'Workers']);
-  }
+    ? [['dashboard', 'Plant overview', 'overview'], ['staff', 'Departments and managers', 'staff']]
+    : isManager
+      ? [['dashboard', 'Department overview', 'overview'], ['shifts', 'Shift assignments', 'shifts'],
+        ['machines', 'Machines', 'machines'], ['staff', 'Workers', 'staff']]
+      : [['shifts', 'My shifts', 'shifts'], ['dashboard', 'Department handover', 'report'], ['machines', 'Machine issues', 'machines']];
+  const name = account.display_name || account.email;
+  const initials = name.split(/[\s._@-]+/).filter(Boolean).slice(0, 2).map((part) => part[0].toUpperCase()).join('');
 
   return (
-    <>
-      <nav className="workspace-nav" aria-label="Operations workspace">
-        {pages.map(([id, label]) => (
-          <button type="button" className="secondary" key={id}
-            aria-current={page === id ? 'page' : undefined} onClick={() => setPage(id)}>{label}</button>
-        ))}
-      </nav>
-      {page === 'dashboard' && (isOwner
-        ? <PlantDashboard onExpired={onExpired} />
-        : <DepartmentDashboard departmentId={account.department_id} canResolve onExpired={onExpired} />)}
-      {page === 'machines' && <MachinePanel isManager={isManager} onExpired={onExpired} />}
-      {page === 'shifts' && <ShiftPanel isManager={isManager} onExpired={onExpired} />}
-      {page === 'staff' && <AccessPanel account={account} onExpired={onExpired} />}
-    </>
+    <div className="operations">
+      <aside className="ops-sidebar">
+        <a className="ops-wordmark" href="/"><span><Icon name="mark" /></span>ShiftBrief</a>
+        <nav className="ops-nav" aria-label="Operations workspace">
+          {pages.map(([id, label, icon]) => (
+            <button type="button" key={id} aria-current={page === id ? 'page' : undefined}
+              onClick={() => setView({ page: id })}><Icon name={icon} /><span>{label}</span></button>
+          ))}
+        </nav>
+        <div className="ops-profile"><span className="ops-avatar" aria-hidden="true">{initials}</span>
+          <div><strong title={name}>{name}</strong><small>{roles[account.role]}</small></div></div>
+      </aside>
+      <div className="ops-body">
+        <div className="ops-toolbar">
+          <div><strong>{roles[account.role]}</strong>
+            {account.department_name && <span>Department: {account.department_name}</span>}
+            {isOwner && <span>All departments</span>}</div>
+          <button className="text-action" type="button" onClick={onSignOut} disabled={signingOut}>
+            <Icon name="exit" />{signingOut ? 'Signing out…' : 'Sign out'}</button>
+        </div>
+        <main className="ops-content">
+          {error && <p className="error" role="alert">{error}</p>}
+          {page === 'dashboard' && (isOwner
+            ? <PlantDashboard onExpired={onExpired} onAccess={() => setView({ page: 'staff' })} />
+            : <DepartmentDashboard departmentId={account.department_id} mode={account.role} onExpired={onExpired}
+              onAssign={isManager ? () => setView({ page: 'shifts', assign: true }) : undefined}
+              onMachines={(machine) => setView({ page: 'machines', machine })} />)}
+          {page === 'machines' && <>
+            <PageTitle title={isManager ? 'Machines' : 'Machine issues'} subtitle={account.department_name} />
+            <MachinePanel isManager={isManager} initialMachine={view.machine} onExpired={onExpired} />
+          </>}
+          {page === 'shifts' && <ShiftPanel isManager={isManager} initialAssign={view.assign} onExpired={onExpired} />}
+          {page === 'staff' && <>
+            <PageTitle title={isOwner ? 'Departments and managers' : 'Workers'} subtitle={account.department_name} />
+            <AccessPanel account={account} onExpired={onExpired} />
+          </>}
+        </main>
+      </div>
+    </div>
   );
 }
 
@@ -176,6 +209,7 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [attempt, setAttempt] = useState(0);
+  const [signingOut, setSigningOut] = useState(false);
 
   const expireSession = useCallback(() => {
     setAccount(null);
@@ -206,29 +240,20 @@ function App() {
 
   async function signOut() {
     setError('');
+    setSigningOut(true);
     try {
       await api('/auth/logout', { method: 'POST' });
       setAccount(null);
     } catch (error) {
       setError(error.message);
+    } finally {
+      setSigningOut(false);
     }
   }
 
   if (loading) return <main><p role="status">Loading ShiftBrief...</p></main>;
-  if (account) return (
-    <main>
-      <header>
-        <div>
-          <p className="brand">ShiftBrief</p>
-          <h1>{roles[account.role]}</h1>
-          <p>{account.email}{account.department_name && ' / ' + account.department_name}</p>
-        </div>
-        <button className="secondary" onClick={signOut}>Sign out</button>
-      </header>
-      {error && <p className="error" role="alert">{error}</p>}
-      <Workspace key={account.id} account={account} onExpired={expireSession} />
-    </main>
-  );
+  if (account) return <Workspace key={account.id} account={account} onExpired={expireSession}
+    onSignOut={signOut} error={error} signingOut={signingOut} />;
 
   return (
     <main className="auth">
@@ -250,6 +275,11 @@ function App() {
           setAccount(session);
         }}>
           <Credentials creating={!ownerExists} />
+          {!ownerExists && (
+            <label>Company name (optional)
+              <input name="display_name" autoComplete="organization" maxLength={100} />
+            </label>
+          )}
         </Form>
       </section>
     </main>

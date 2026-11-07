@@ -12,10 +12,12 @@ from typing import Annotated, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import AwareDatetime, BaseModel, ConfigDict, EmailStr, Field, StringConstraints, model_validator
 
 DATABASE = Path(os.getenv("SHIFTBRIEF_DB", Path(__file__).with_name("shiftbrief.sqlite3")))
+FRONTEND = Path(__file__).resolve().parents[1] / "frontend" / "dist"
 COOKIE_NAME = "shiftbrief_session"
 SESSION_SECONDS = 8 * 60 * 60
 SECURE_COOKIE = os.getenv("SHIFTBRIEF_SECURE_COOKIE") == "1"
@@ -32,6 +34,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     password_hash TEXT NOT NULL,
     role TEXT NOT NULL CHECK (role IN ('owner', 'manager', 'worker')),
     department_id INTEGER REFERENCES departments(id),
+    display_name TEXT,
     CHECK ((role = 'owner') = (department_id IS NULL))
 );
 CREATE UNIQUE INDEX IF NOT EXISTS one_owner ON accounts(role) WHERE role = 'owner';
@@ -69,6 +72,7 @@ CREATE TABLE IF NOT EXISTS shifts (
     starts_at TEXT NOT NULL,
     ends_at TEXT NOT NULL,
     questions TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
     CHECK (ends_at > starts_at)
 );
 CREATE INDEX IF NOT EXISTS shifts_department ON shifts(department_id, starts_at);
@@ -115,6 +119,14 @@ def connect() -> sqlite3.Connection:
 async def lifespan(_: FastAPI):
     with closing(connect()) as connection:
         connection.executescript(SCHEMA)
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            columns = connection.execute("PRAGMA table_info(accounts)").fetchall()
+            if not any(column["name"] == "display_name" for column in columns):
+                connection.execute("ALTER TABLE accounts ADD COLUMN display_name TEXT")
+            shift_columns = connection.execute("PRAGMA table_info(shifts)").fetchall()
+            if not any(column["name"] == "description" for column in shift_columns):
+                connection.execute("ALTER TABLE shifts ADD COLUMN description TEXT NOT NULL DEFAULT ''")
     yield
 
 
@@ -159,6 +171,7 @@ class Login(BaseModel):
 
 class NewAccount(Login):
     password: str = Field(min_length=12, max_length=128)
+    display_name: Annotated[str, StringConstraints(strip_whitespace=True, max_length=100)] | None = None
 
 
 class NewManager(NewAccount):
@@ -181,6 +194,7 @@ class Account(BaseModel):
     role: Role
     department_id: int | None
     department_name: str | None
+    display_name: str | None = None
 
 
 ACCOUNT_QUERY = """
@@ -201,8 +215,9 @@ def insert_account(db: DB, data: NewAccount, role: Role, department_id: int | No
     try:
         with db:
             cursor = db.execute(
-                "INSERT INTO accounts(email, password_hash, role, department_id) VALUES (?, ?, ?, ?)",
-                (data.email.casefold(), stored_hash, role, department_id),
+                """INSERT INTO accounts(email, password_hash, role, department_id, display_name)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (data.email.casefold(), stored_hash, role, department_id, data.display_name or None),
             )
     except sqlite3.IntegrityError as exc:
         if role == "owner" and owner_exists(db):
@@ -392,7 +407,12 @@ class MachineUpdate(MachineUpdateInput):
 class Machine(MachineName):
     id: int
     archived: bool
+    status: MachineStatus = "Working"
     latest: MachineUpdate | None
+
+
+class MachineListItem(Machine):
+    recent_updates: list[MachineUpdate] = Field(default_factory=list)
 
 
 class MachineHistory(Machine):
@@ -432,27 +452,46 @@ def machine_from_row(row: sqlite3.Row) -> Machine:
             id=row["update_id"], status=row["status"], note=row["note"],
             recorded_at=row["recorded_at"], worker_email=row["worker_email"],
         )
-    return Machine(id=row["id"], name=row["name"], archived=row["archived"], latest=latest)
+    return Machine(
+        id=row["id"], name=row["name"], archived=row["archived"],
+        status=latest.status if latest else "Working", latest=latest,
+    )
 
 
 @app.get("/api/machines")
-def list_machines(db: DB, account: DepartmentStaff) -> list[Machine]:
-    rows = db.execute(
-        MACHINE_QUERY + " WHERE m.department_id = ? AND (? OR m.archived = 0)"
-        " ORDER BY m.archived, m.name COLLATE NOCASE, m.id",
-        (account.department_id, account.role == "manager"),
-    )
-    return [machine_from_row(row) for row in rows]
+def list_machines(db: DB, account: DepartmentStaff) -> list[MachineListItem]:
+    scope = " WHERE m.department_id = ? AND (? OR m.archived = 0)"
+    params = (account.department_id, account.role == "manager")
+    with db:
+        db.execute("BEGIN")
+        machines = [
+            MachineListItem(**machine_from_row(row).model_dump())
+            for row in db.execute(
+                MACHINE_QUERY + scope + " ORDER BY m.archived, m.name COLLATE NOCASE, m.id", params,
+            )
+        ]
+        by_id = {machine.id: machine for machine in machines}
+        for row in db.execute(
+            """SELECT m.id AS machine_id, u.id, u.status, u.note, u.recorded_at, a.email AS worker_email
+               FROM machines m JOIN machine_updates u ON u.id IN (
+                   SELECT id FROM machine_updates WHERE machine_id = m.id ORDER BY id DESC LIMIT 3
+               ) JOIN accounts a ON a.id = u.worker_id"""
+            + scope + " ORDER BY m.id, u.id DESC",
+            params,
+        ):
+            update = dict(row)
+            by_id[update.pop("machine_id")].recent_updates.append(MachineUpdate.model_validate(update))
+    return machines
 
 
 @app.post("/api/machines", status_code=201)
-def register_machine(data: MachineName, db: DB, account: Manager) -> Machine:
+def register_machine(data: MachineName, db: DB, account: Manager) -> MachineListItem:
     with db:
         cursor = db.execute(
             "INSERT INTO machines (department_id, name) VALUES (?, ?)",
             (account.department_id, data.name),
         )
-    return Machine(id=cursor.lastrowid, name=data.name, archived=False, latest=None)
+    return MachineListItem(id=cursor.lastrowid, name=data.name, archived=False, latest=None)
 
 
 @app.get("/api/machines/{machine_id}")
@@ -491,7 +530,7 @@ def edit_machine(machine_id: int, data: MachineName, db: DB, account: Manager) -
 
 @app.post("/api/machines/{machine_id}/updates", status_code=201)
 def record_machine_update(
-    machine_id: int, data: MachineUpdateInput, db: DB, account: Worker,
+    machine_id: int, data: MachineUpdateInput, db: DB, account: DepartmentStaff,
 ) -> MachineUpdate:
     with db:
         db.execute("BEGIN IMMEDIATE")
@@ -545,6 +584,7 @@ class AssignmentSelection(BaseModel):
 
     worker_ids: list[Annotated[int, Field(gt=0)]] = Field(min_length=1, max_length=200)
     questions: list[SelectedQuestion] = Field(default_factory=list, max_length=50)
+    description: Annotated[str, StringConstraints(strip_whitespace=True, max_length=2000)] = ""
 
     @model_validator(mode="after")
     def validate_assignment(self):
@@ -572,6 +612,7 @@ class ShiftBatch(AssignmentSelection):
 class AssignedWorker(BaseModel):
     id: int
     email: str
+    display_name: str | None = None
 
 
 ReportStatus = Literal["Pending", "Draft", "Submitted", "Late"]
@@ -581,10 +622,12 @@ class Shift(BaseModel):
     id: int
     starts_at: datetime
     ends_at: datetime
+    description: str = ""
     questions: list[Question]
     workers: list[AssignedWorker]
     locked: bool = False
     report_status: ReportStatus = "Pending"
+    report_summary: str | None = None
 
 
 @app.get("/api/reporting-questions")
@@ -633,7 +676,7 @@ def save_assignments(
         workers = {
             row["id"]: AssignedWorker.model_validate(dict(row))
             for row in db.execute(
-                "SELECT id, email FROM accounts WHERE department_id = ? AND role = 'worker'",
+                "SELECT id, email, display_name FROM accounts WHERE department_id = ? AND role = 'worker'",
                 (account.department_id,),
             )
         }
@@ -663,17 +706,18 @@ def save_assignments(
                 starts_at.isoformat(timespec="microseconds"),
                 ends_at.isoformat(timespec="microseconds"),
                 snapshot,
+                data.description,
             )
             if existing_id is None:
                 cursor = db.execute(
-                    "INSERT INTO shifts (department_id, starts_at, ends_at, questions) VALUES (?, ?, ?, ?)",
+                    "INSERT INTO shifts (department_id, starts_at, ends_at, questions, description) VALUES (?, ?, ?, ?, ?)",
                     (account.department_id, *values),
                 )
                 shift_id = cursor.lastrowid
             else:
                 shift_id = existing_id
                 db.execute(
-                    "UPDATE shifts SET starts_at = ?, ends_at = ?, questions = ? WHERE id = ?",
+                    "UPDATE shifts SET starts_at = ?, ends_at = ?, questions = ?, description = ? WHERE id = ?",
                     (*values, shift_id),
                 )
                 db.execute("DELETE FROM shift_workers WHERE shift_id = ?", (shift_id,))
@@ -702,7 +746,7 @@ def save_assignments(
                     )
             shifts.append(Shift(
                 id=shift_id, starts_at=starts_at, ends_at=ends_at,
-                questions=questions, workers=assigned_workers,
+                description=data.description, questions=questions, workers=assigned_workers,
             ))
     return shifts
 
@@ -752,10 +796,11 @@ def delete_shift(shift_id: int, db: DB, account: Manager) -> None:
 @app.get("/api/shifts")
 def list_shifts(db: DB, account: DepartmentStaff) -> list[Shift]:
     rows = db.execute(
-        """SELECT s.id, s.starts_at, s.ends_at, s.questions, a.id AS worker_id, a.email,
+        """SELECT s.id, s.starts_at, s.ends_at, s.questions, s.description, a.id AS worker_id, a.email, a.display_name,
                   EXISTS (SELECT 1 FROM shift_reports
                           WHERE shift_id = s.id AND submitted_at IS NOT NULL) AS locked,
-                  r.shift_id AS report_id, r.submitted_at, r.late
+                  r.shift_id AS report_id, r.submitted_at, r.late,
+                  CASE WHEN r.submitted_at IS NOT NULL THEN r.summary END AS report_summary
            FROM shifts s JOIN shift_workers sw ON sw.shift_id = s.id
            JOIN accounts a ON a.id = sw.worker_id
            LEFT JOIN shift_reports r ON r.shift_id = s.id AND r.worker_id = a.id
@@ -770,11 +815,14 @@ def list_shifts(db: DB, account: DepartmentStaff) -> list[Shift]:
         if shift_id not in shifts:
             shifts[shift_id] = Shift(
                 id=shift_id, starts_at=row["starts_at"], ends_at=row["ends_at"],
-                questions=json.loads(row["questions"]), workers=[],
+                description=row["description"], questions=json.loads(row["questions"]), workers=[],
                 locked=bool(row["locked"]) if account.role == "manager" else False,
                 report_status=report_status(row) if account.role == "worker" else "Pending",
+                report_summary=row["report_summary"] if account.role == "worker" else None,
             )
-        shifts[shift_id].workers.append(AssignedWorker(id=row["worker_id"], email=row["email"]))
+        shifts[shift_id].workers.append(AssignedWorker(
+            id=row["worker_id"], email=row["email"], display_name=row["display_name"],
+        ))
     return list(shifts.values())
 
 
@@ -805,7 +853,7 @@ def report_status(row: sqlite3.Row) -> ReportStatus:
 
 
 def shift_revision(shift: sqlite3.Row) -> str:
-    content = json.dumps([shift["starts_at"], shift["ends_at"], shift["questions"]])
+    content = json.dumps([shift["starts_at"], shift["ends_at"], shift["questions"], shift["description"]])
     return hashlib.sha256(content.encode()).hexdigest()
 
 
@@ -833,6 +881,7 @@ def report_content(db: DB, shift: sqlite3.Row, worker_id: int) -> dict:
         "worker_id": worker_id,
         "starts_at": shift["starts_at"],
         "ends_at": shift["ends_at"],
+        "description": shift["description"],
         "questions": json.loads(shift["questions"]),
         "revision": shift_revision(shift),
         "status": report_status(report) if report else "Pending",
@@ -893,7 +942,7 @@ def save_report(shift_id: int, data: ReportInput, db: DB, worker: Worker, *, sub
                  answers = excluded.answers, summary = excluded.summary, issue = excluded.issue,
                  machine_id = excluded.machine_id, submitted_at = excluded.submitted_at, late = excluded.late""",
             (shift_id, worker.id, json.dumps(data.answers), data.summary, data.issue, data.machine_id,
-             now.isoformat() if submit else None, submit and now > datetime.fromisoformat(shift["ends_at"])),
+             now.isoformat() if submit else None, submit and now >= datetime.fromisoformat(shift["ends_at"])),
         )
         return report_content(db, shift, worker.id)
 
@@ -909,7 +958,7 @@ def submit_report(shift_id: int, data: ReportInput, db: DB, worker: Worker) -> d
 
 
 def dashboard_department(db: DB, account: Account, department_id: int) -> Department:
-    if account.role == "worker" or (account.role == "manager" and account.department_id != department_id):
+    if account.role != "owner" and account.department_id != department_id:
         raise HTTPException(403, "Dashboard access is required for this department.")
     row = db.execute("SELECT id, name FROM departments WHERE id = ?", (department_id,)).fetchone()
     if row is None:
@@ -959,7 +1008,7 @@ def resolve_report_issue(shift_id: int, worker_id: int, data: ResolutionInput, d
 def department_metrics(db: DB, department_ids: list[int], now: datetime) -> dict[int, dict]:
     metrics = {
         department_id: {
-            "machines": {status: 0 for status in ("Working", "Not Working", "Has Issues", "Awaiting first update")},
+            "machines": {status: 0 for status in ("Working", "Not Working", "Has Issues")},
             "due": 0, "overdue": 0, "report_issues": 0,
         }
         for department_id in department_ids
@@ -969,7 +1018,7 @@ def department_metrics(db: DB, department_ids: list[int], now: datetime) -> dict
     scope = " = ?" if len(metrics) == 1 else " IS NOT NULL"
     params = tuple(metrics) if len(metrics) == 1 else ()
     for row in db.execute(
-        """SELECT m.department_id, COALESCE(u.status, 'Awaiting first update') AS status, COUNT(*) AS total
+        """SELECT m.department_id, COALESCE(u.status, 'Working') AS status, COUNT(*) AS total
            FROM machines m LEFT JOIN machine_updates u ON u.id = (
              SELECT id FROM machine_updates WHERE machine_id = m.id ORDER BY id DESC LIMIT 1
            ) WHERE m.archived = 0 AND m.department_id""" + scope + " GROUP BY m.department_id, status",
@@ -979,8 +1028,8 @@ def department_metrics(db: DB, department_ids: list[int], now: datetime) -> dict
     stamp = now.isoformat(timespec="microseconds")
     for row in db.execute(
         """SELECT s.department_id,
-                  SUM(r.submitted_at IS NULL AND s.starts_at <= ? AND s.ends_at >= ?) AS due,
-                  SUM(r.submitted_at IS NULL AND s.ends_at < ?) AS overdue,
+                  SUM(r.submitted_at IS NULL AND s.starts_at <= ? AND s.ends_at > ?) AS due,
+                  SUM(r.submitted_at IS NULL AND s.ends_at <= ?) AS overdue,
                   SUM(r.submitted_at IS NOT NULL AND r.issue != '' AND rr.shift_id IS NULL) AS report_issues
            FROM shifts s JOIN shift_workers sw ON sw.shift_id = s.id
            LEFT JOIN shift_reports r ON r.shift_id = s.id AND r.worker_id = sw.worker_id
@@ -994,11 +1043,53 @@ def department_metrics(db: DB, department_ids: list[int], now: datetime) -> dict
 
 
 @app.get("/api/dashboard")
-def plant_dashboard(db: DB, _: Owner) -> dict:
+def plant_dashboard(db: DB, owner: Owner) -> dict:
     db.execute("BEGIN")
     departments = db.execute("SELECT id, name FROM departments ORDER BY name").fetchall()
-    metrics = department_metrics(db, [row["id"] for row in departments], datetime.now(UTC))
-    return {"departments": [{**dict(row), "metrics": metrics[row["id"]]} for row in departments]}
+    now = datetime.now(UTC)
+    metrics = department_metrics(db, [row["id"] for row in departments], now)
+    managers = {row["id"]: [] for row in departments}
+    for row in db.execute(
+        "SELECT department_id, email, display_name FROM accounts WHERE role = 'manager' ORDER BY email"
+    ):
+        managers[row["department_id"]].append(row["display_name"] or row["email"])
+    return {
+        "company_name": owner.display_name or os.getenv("SHIFTBRIEF_COMPANY_NAME", "").strip() or "Company",
+        "as_of": now,
+        "departments": [
+            {**dict(row), "metrics": metrics[row["id"]], "managers": managers[row["id"]]}
+            for row in departments
+        ],
+    }
+
+
+@app.get("/api/departments/{department_id}/roster")
+def department_roster(department_id: int, db: DB, owner: Owner) -> list[dict]:
+    dashboard_department(db, owner, department_id)
+    stamp = datetime.now(UTC).isoformat(timespec="microseconds")
+    rows = db.execute(
+        """SELECT a.id, a.email, a.display_name, scheduled.shift_id, scheduled.starts_at, scheduled.ends_at
+           FROM accounts a LEFT JOIN (
+               SELECT sw.worker_id, s.id AS shift_id, s.starts_at, s.ends_at
+               FROM shifts s JOIN shift_workers sw ON sw.shift_id = s.id
+               WHERE s.department_id = ? AND s.ends_at > ?
+                 AND NOT EXISTS (SELECT 1 FROM deleted_shifts WHERE shift_id = s.id)
+           ) scheduled ON scheduled.worker_id = a.id
+           WHERE a.role = 'worker' AND a.department_id = ?
+           ORDER BY COALESCE(a.display_name, a.email) COLLATE NOCASE, a.id,
+                    scheduled.starts_at, scheduled.shift_id""",
+        (department_id, stamp, department_id),
+    )
+    workers = {}
+    for row in rows:
+        worker = workers.setdefault(row["id"], {
+            "id": row["id"], "name": row["display_name"] or row["email"], "shifts": [],
+        })
+        if row["shift_id"] is not None:
+            worker["shifts"].append({
+                "id": row["shift_id"], "starts_at": row["starts_at"], "ends_at": row["ends_at"],
+            })
+    return list(workers.values())
 
 
 @app.get("/api/departments/{department_id}/dashboard")
@@ -1015,12 +1106,15 @@ def department_dashboard(department_id: int, db: DB, account: SignedIn) -> dict:
     ]
     activity = [
         dict(row) for row in db.execute(
-            """SELECT s.id AS shift_id, s.starts_at, s.ends_at, a.id AS worker_id, a.email AS worker_email,
+            """SELECT s.id AS shift_id, s.starts_at, s.ends_at, s.description,
+                      a.id AS worker_id, a.email AS worker_email,
+                      COALESCE(a.display_name, a.email) AS worker_name,
                       r.submitted_at, COALESCE(r.late, 0) AS late,
+                      CASE WHEN r.submitted_at IS NOT NULL THEN r.summary END AS summary,
                       CASE
                         WHEN r.submitted_at IS NOT NULL THEN 'Submitted'
                         WHEN s.starts_at > ? THEN 'Upcoming'
-                        WHEN s.ends_at < ? THEN 'Overdue'
+                        WHEN s.ends_at <= ? THEN 'Overdue'
                         ELSE 'Due'
                       END AS status,
                       CASE WHEN r.submitted_at IS NOT NULL AND rr.shift_id IS NULL THEN r.issue END AS open_issue,
@@ -1041,3 +1135,24 @@ def department_dashboard(department_id: int, db: DB, account: SignedIn) -> dict:
         "metrics": department_metrics(db, [department_id], now)[department_id],
         "machines": machines, "activity": activity,
     }
+
+
+@app.get("/api/health", include_in_schema=False)
+def health(db: DB) -> dict[str, str]:
+    db.execute("SELECT 1 FROM departments LIMIT 1").fetchone()
+    return {"status": "ok"}
+
+
+if (FRONTEND / "index.html").is_file() and (FRONTEND / "assets").is_dir():
+    app.mount("/assets", StaticFiles(directory=FRONTEND / "assets"), name="frontend-assets")
+
+    @app.get("/", include_in_schema=False)
+    @app.get("/app", include_in_schema=False)
+    @app.get("/app/", include_in_schema=False)
+    def frontend_entry():
+        return FileResponse(FRONTEND / "index.html", headers={"Cache-Control": "no-cache"})
+
+    @app.get("/shiftbrief.svg", include_in_schema=False)
+    @app.get("/shiftbrief-factory.webp", include_in_schema=False)
+    def frontend_public(request: Request):
+        return FileResponse(FRONTEND / request.url.path.lstrip("/"))

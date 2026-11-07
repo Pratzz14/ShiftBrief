@@ -1,6 +1,8 @@
 import { useId, useState } from 'react';
 import { Dialog, Form, LoadState, formatDate, useResource, write } from './ui';
 import { WorkerReport } from './reports';
+import { Badge, Empty, Icon, Metrics, PageTitle, ShiftWhen, Table } from './operations-ui';
+import { shiftWindow, useClock } from './shift-time';
 
 const localZone = new Intl.DateTimeFormat().resolvedOptions().timeZone;
 const weekdays = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
@@ -126,8 +128,7 @@ function AssignmentForm({ workers, questions, onAssign, shift }) {
   }
 
   return (
-    <section className={shift ? undefined : 'card'}>
-      {!shift && <h2>Assign a shift</h2>}
+    <section>
       {!workers.length ? <p>Add a worker from the Workers page to assign a shift.</p> : (
         <Form label={shift ? 'Save changes' : weekly ? 'Create weekly schedule' : 'Assign shift'} clear={!shift}
           onSubmit={async (data, formData) => {
@@ -140,6 +141,7 @@ function AssignmentForm({ workers, questions, onAssign, shift }) {
           };
           await onAssign({
             ...timing,
+            description: data.description,
             worker_ids: workerIds,
             questions: questions.filter((question) => Object.hasOwn(selectedQuestions, question.id))
               .map(({ id }) => ({ id, required: selectedQuestions[id] })),
@@ -182,10 +184,14 @@ function AssignmentForm({ workers, questions, onAssign, shift }) {
               <label key={worker.id} className="choice">
                 <input type="checkbox" checked={workerIds.includes(worker.id)}
                   onChange={(event) => toggleWorker(worker.id, event.target.checked)} />
-                {worker.email}
+                {worker.display_name || worker.email}
               </label>
             ))}
           </fieldset>
+          <label>Shift description (optional)
+            <textarea name="description" defaultValue={shift?.description ?? ''} maxLength={2000}
+              placeholder="Add planned work, checks, and handover instructions." />
+          </label>
           <fieldset className="choices">
             <legend>Reporting questions</legend>
             {questions.length === 0 && <p>Add questions in the library to include them in a shift.</p>}
@@ -215,56 +221,112 @@ function AssignmentForm({ workers, questions, onAssign, shift }) {
   );
 }
 
-function ShiftList({ shifts, isManager, onAction }) {
-  return (
-    <section className="card">
-      <h2>{isManager ? 'Scheduled shifts' : 'My Shifts'}</h2>
-      {shifts.length ? (
-        <ul className="record-list">
-          {shifts.map((shift) => (
-            <li key={shift.id}>
-              <strong>
-                <time dateTime={shift.starts_at}>{formatDate(shift.starts_at)}</time>
-                {' to '}
-                <time dateTime={shift.ends_at}>{formatDate(shift.ends_at)}</time>
-              </strong>
-              {isManager && <small>{shift.workers.map((worker) => worker.email).join(', ')}</small>}
-              {shift.questions.length ? (
-                <ol>
-                  {shift.questions.map((question) => (
-                    <li key={question.id} className="note">
-                      {question.prompt} <small>{question.required ? 'Required' : 'Optional'}</small>
-                    </li>
-                  ))}
-                </ol>
-              ) : <p>No reporting questions for this shift.</p>}
-              {isManager ? shift.locked ? <p>Locked after report submission</p> : (
-                <div className="shift-actions">
-                  <button type="button" className="secondary" onClick={() => onAction({ shift, action: 'edit' })}>Edit shift</button>
-                  <button type="button" className="secondary" onClick={() => onAction({ shift, action: 'delete' })}>Delete shift</button>
-                </div>
-              ) : (
-                <div className="shift-actions">
-                  <button type="button" className="secondary" onClick={() => onAction({ shift, action: 'report' })}>
-                    {shift.report_status === 'Pending' ? 'Start report' : 'Open report'}
-                  </button>
-                  <small>{shift.report_status === 'Late' ? 'Submitted late' : shift.report_status}</small>
-                </div>
-              )}
-            </li>
-          ))}
-        </ul>
-      ) : <p>No shifts assigned yet.</p>}
-    </section>
-  );
+const isSubmitted = (shift) => ['Submitted', 'Late'].includes(shift.report_status);
+const isOverdue = (shift) => shift.phase === 'Completed' && !isSubmitted(shift);
+const reportLabel = (shift) => shift.report_status === 'Late' ? 'Submitted late'
+  : isOverdue(shift) ? 'Report overdue' : shift.report_status;
+const describe = (shift) => shift.description || 'No shift description provided.';
+
+function ReportAction({ shift, onAction, primary = false }) {
+  const label = isSubmitted(shift) ? 'View report' : shift.report_status === 'Draft' ? 'Continue draft'
+    : shift.phase === 'Upcoming' ? 'Draft report' : 'Start report';
+  return <button type="button" className={primary && !isSubmitted(shift) ? '' : 'secondary compact'}
+    onClick={() => onAction({ shift, action: 'report' })}>
+    {primary && <Icon name="report" />}{label}
+  </button>;
 }
 
-export function ShiftPanel({ isManager, onExpired }) {
+function WorkerShifts({ shifts, now, onAction }) {
+  const [showUpcoming, setShowUpcoming] = useState(false);
+  const today = shifts.filter((shift) => shift.today).reverse();
+  const future = shifts.filter((shift) => shift.phase === 'Upcoming').reverse();
+  const past = shifts.filter((shift) => shift.phase === 'Completed').sort(
+    (a, b) => Date.parse(b.ends_at) - Date.parse(a.ends_at) || b.id - a.id,
+  );
+  const next = future[0];
+  const overdue = past.filter(isOverdue).length;
+  return <>
+    <PageTitle title="My shifts" subtitle="See your assignments, record your work, and catch up on handover." now={now} />
+    <Metrics items={[
+      ['In progress', today.filter((shift) => shift.phase === 'In progress').length],
+      ['Today', today.length], ['Reports overdue', overdue, null, overdue > 0],
+    ]} />
+    <div className="ops-split worker-split">
+      <section className="card">
+        <h2>Today’s shifts</h2>
+        {today.length ? <ul className="today-list">{today.map((shift) => <li key={shift.id}>
+          <div className="today-top"><ShiftWhen shift={shift} /><Badge>{shift.phase}</Badge></div>
+          <div className="today-bottom"><div><strong>Shift description</strong>
+            <p className="note table-note">{describe(shift)}</p></div>
+            <ReportAction shift={shift} onAction={onAction} primary /></div>
+          {shift.report_status !== 'Pending' || isOverdue(shift) ? <Badge>{reportLabel(shift)}</Badge> : null}
+        </li>)}</ul> : <Empty>No assignments overlap today.</Empty>}
+      </section>
+      <section className="card">
+        <h2>Next shift</h2>
+        {next ? <>
+          <ShiftWhen shift={next} />
+          <p className="note">{describe(next)}</p>
+          <ReportAction shift={next} onAction={onAction} />
+          {future.length > 1 && <div className="upcoming-toggle">
+            <button type="button" className="text-action" aria-expanded={showUpcoming} aria-controls="later-shifts"
+              onClick={() => setShowUpcoming(!showUpcoming)}>{showUpcoming ? 'Hide' : 'Show'} later shifts ({future.length - 1})</button>
+            <div id="later-shifts" hidden={!showUpcoming}>{showUpcoming && <Table columns={['Shift', 'Report']} rows={future.slice(1)}
+              label="Later shifts" render={(shift) => <tr key={shift.id}><th scope="row"><ShiftWhen shift={shift} />
+                <p className="note table-note">{describe(shift)}</p></th><td><ReportAction shift={shift} onAction={onAction} /></td></tr>} />}</div>
+          </div>}
+        </> : <Empty>No upcoming shifts scheduled.</Empty>}
+      </section>
+    </div>
+    <section className="card worker-history">
+      <h2>Past shifts</h2>
+      <Table columns={['Shift', 'Description', 'Report', 'Action']} rows={past} label="My past shifts"
+        empty="Your completed assignments will appear here." render={(shift) => <tr role="row" key={shift.id}>
+          <th scope="row" role="rowheader"><ShiftWhen shift={shift} /></th><td className="note" role="cell">{describe(shift)}</td>
+          <td role="cell"><Badge>{reportLabel(shift)}</Badge>
+            {isSubmitted(shift) && <p className="note table-note">{shift.report_summary || 'No summary provided.'}</p>}</td>
+          <td role="cell"><ReportAction shift={shift} onAction={onAction} primary={isOverdue(shift)} /></td>
+        </tr>} />
+    </section>
+  </>;
+}
+
+function Schedule({ shifts, onAction }) {
+  const [filter, setFilter] = useState('Today and upcoming');
+  const rows = shifts.filter((shift) => filter === 'All shifts' || (filter === 'Completed'
+    ? shift.phase === 'Completed' : shift.today || shift.phase === 'Upcoming'));
+  if (filter === 'Today and upcoming') rows.reverse();
+  return <section className="card">
+    <div className="panel-heading"><h2>Scheduled shifts</h2>
+      <select aria-label="Shift date filter" value={filter} onChange={(event) => setFilter(event.target.value)}>
+        <option>Today and upcoming</option><option>Completed</option><option>All shifts</option>
+      </select></div>
+    <Table key={filter} columns={['Shift', 'Assignment', 'Status', 'Actions']} rows={rows} label="Scheduled shifts"
+      empty="No shifts match this view." render={(shift) => <tr key={shift.id}>
+        <th scope="row"><ShiftWhen shift={shift} /></th>
+        <td><strong>{shift.workers.map((worker) => worker.display_name || worker.email).join(', ')}</strong>
+          <p className="note table-note">{describe(shift)}</p>
+          {!!shift.questions.length && <details><summary>{shift.questions.length} reporting questions</summary>
+            <ol>{shift.questions.map((question) => <li className="note" key={question.id}>
+              {question.prompt} <small>{question.required ? 'Required' : 'Optional'}</small>
+            </li>)}</ol></details>}</td>
+        <td><Badge>{shift.phase}</Badge></td>
+        <td>{shift.locked ? <small>Locked after report submission</small> : <div className="row-actions">
+          <button type="button" className="secondary compact" onClick={() => onAction({ shift, action: 'edit' })}>Edit shift</button>
+          <button type="button" className="secondary compact" onClick={() => onAction({ shift, action: 'delete' })}>Delete shift</button>
+        </div>}</td>
+      </tr>} />
+  </section>;
+}
+
+export function ShiftPanel({ isManager, initialAssign, onExpired }) {
   const shifts = useResource('/shifts', onExpired);
   const workers = useResource(isManager ? '/staff' : null, onExpired);
   const questions = useResource(isManager ? '/reporting-questions' : null, onExpired);
   const [notice, setNotice] = useState('');
-  const [dialog, setDialog] = useState(null);
+  const [dialog, setDialog] = useState(initialAssign ? { action: 'assign' } : null);
+  const now = useClock();
+  const assignments = shifts.data?.map((shift) => ({ ...shift, ...shiftWindow(shift, now) }));
 
   function saveToList(saved) {
     const ids = new Set(saved.map(({ id }) => id));
@@ -287,28 +349,35 @@ export function ShiftPanel({ isManager, onExpired }) {
     const result = await write(weekly ? '/shifts/batch' : '/shifts', 'POST', data, onExpired);
     const created = weekly ? result : [result];
     saveToList(created);
+    setDialog(null);
     setNotice(weekly ? 'Weekly schedule created (' + created.length + ' shifts).' : 'Shift assigned.');
   }
 
   return (
     <>
-      {notice && <p role="status">{notice}</p>}
       {isManager && (
-        <div className="panels section-gap">
-          {workers.data && questions.data && shifts.data ? (
-            <AssignmentForm workers={workers.data} questions={questions.data} onAssign={assign} />
-          ) : !workers.data ? <LoadState resource={workers} label="workers" /> : null}
-          {questions.data
-            ? <QuestionLibrary questions={questions.data} onSave={saveQuestion} />
-            : <LoadState resource={questions} label="reporting questions" />}
-        </div>
+        <PageTitle title="Shift assignments" subtitle="Schedule work and manage reporting questions." now={now}
+          action={<button type="button" onClick={() => setDialog({ action: 'assign' })}>Assign shift</button>} />
       )}
-      {shifts.data ? <ShiftList shifts={shifts.data} isManager={isManager} onAction={setDialog} /> : <LoadState resource={shifts} label="shifts" />}
+      {notice && <p className="ops-notice" role="status">{notice}</p>}
+      {!shifts.data ? <LoadState resource={shifts} label="shifts" /> : isManager ? (
+        <>
+          <Schedule shifts={assignments} onAction={setDialog} />
+          <details className="question-disclosure"><summary>Manage reporting questions</summary>
+            {questions.data ? <QuestionLibrary questions={questions.data} onSave={saveQuestion} />
+              : <LoadState resource={questions} label="reporting questions" />}
+          </details>
+        </>
+      ) : <WorkerShifts shifts={assignments} now={now} onAction={setDialog} />}
       {dialog && (
-        <Dialog title={{ edit: 'Edit shift', delete: 'Delete shift', report: 'Shift report' }[dialog.action]}
+        <Dialog title={{ assign: 'Assign a shift', edit: 'Edit shift', delete: 'Delete shift', report: 'Shift report' }[dialog.action]}
           dismissLabel={dialog.action === 'report' ? 'Close report' : 'Cancel'}
           onDismiss={() => setDialog(null)}>
-          {dialog.action === 'edit' ? (
+          {dialog.action === 'assign' ? (
+            workers.data && questions.data && shifts.data
+              ? <AssignmentForm workers={workers.data} questions={questions.data} onAssign={assign} />
+              : <LoadState resource={!workers.data ? workers : !questions.data ? questions : shifts} label="shift options" />
+          ) : dialog.action === 'edit' ? (
             workers.data && questions.data ? (
               <AssignmentForm shift={dialog.shift} workers={workers.data}
                 questions={[
@@ -325,7 +394,7 @@ export function ShiftPanel({ isManager, onExpired }) {
           ) : dialog.action === 'report' ? (
             <WorkerReport shiftId={dialog.shift.id} onExpired={onExpired} onSave={(report) => {
               shifts.setData((current) => current.map((shift) => shift.id === report.shift_id
-                ? { ...shift, report_status: report.status } : shift));
+                ? { ...shift, report_status: report.status, report_summary: report.submitted_at ? report.summary : null } : shift));
             }} />
           ) : (
             <Form label="Confirm delete" onSubmit={async () => {

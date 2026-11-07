@@ -6,6 +6,7 @@ export function ReportDetails({ report }) {
     <div className="report-details">
       {report.worker_email && <p>{report.worker_email}</p>}
       <p>{formatDate(report.starts_at)} to {formatDate(report.ends_at)}</p>
+      {report.description && <><h3>Shift description</h3><p className="note">{report.description}</p></>}
       <p><strong>{report.status === 'Late' ? 'Submitted late' : 'Submitted'}</strong> · {formatDate(report.submitted_at)}</p>
       {report.questions.length > 0 && (
         <dl>
@@ -78,7 +79,11 @@ function ReportEditor({ report, machines, onSave, onReload }) {
     <form onSubmit={save}>
       <fieldset disabled={pending}>
         <p>{formatDate(report.starts_at)} to {formatDate(report.ends_at)}</p>
-        <p>Submission opens at shift start. Reports submitted after shift end are marked late.</p>
+        {report.description && <div className="assignment-note">
+          <strong>Shift description</strong><p className="note table-note">{report.description}</p>
+        </div>}
+        <p>You can save answers and status notes as a draft before the shift starts. Submission opens at shift start.</p>
+        <small>Reports submitted after the shift ends are marked late.</small>
         {report.questions.map(({ id, prompt, required }) => (
           <label key={id}>{prompt} {required ? '(required to submit)' : '(optional)'}
             <textarea name={'question-' + id} maxLength={4000} defaultValue={report.answers[id]} />
