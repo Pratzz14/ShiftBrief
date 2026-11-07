@@ -1,74 +1,97 @@
 # ShiftBrief
 
-ShiftBrief provides a machine register, shift assignments, worker reports, issue follow-up, and operations dashboards for one plant.
+ShiftBrief is a shift handover app for a single plant. Managers schedule work and define what workers need to report. Workers record machine conditions and submit shift reports. Department teams can see what happened and what still needs follow-up, while the plant owner can compare departments.
 
-## Run locally
+The public homepage is at `/`. The signed-in operations workspace is at `/app`.
 
-Use Python 3.12 and Node.js 22.12 or later on the Node 22 line. From the repository root, start the API in PowerShell.
+## Features
+
+| Workspace | What you can do |
+| --- | --- |
+| **Plant owner** | Create departments and manager accounts. Compare machine conditions and report coverage across departments. Drill into read-only department dashboards, rosters, and worker schedules. |
+| **Department manager** | Add workers and register machines. Schedule one-time, weekly, and overnight shifts for one or more workers. Add shift instructions and choose reusable required or optional questions. Review reports and resolve flagged issues. |
+| **Worker** | See today's assignments, the next shift, and shift history. Type or record a shift update, review answers, save a draft, and submit a report. Record machine conditions and read the department handover. |
+
+- **Shift reports** use the questions saved with each assignment. With draft generation enabled, one update can fill blank answers, suggest notes, ask for clarification, and highlight issues. Workers review and edit the result before submitting.
+- **Report rules** allow drafts before a shift starts. Submission requires all required answers and opens at shift start. Reports submitted at or after the scheduled end are marked late. Submitted reports are read-only and can include unanswered optional clarifications.
+- **Machine history** tracks who recorded each condition and when. The available conditions are **Working**, **Has Issues**, and **Not Working**. A note is required for the last two.
+- **Follow-up** collects open machine faults and report issues. Recording **Working** clears a machine fault. Managers close report issues with a resolution note.
+- **Scheduling** supports editing or deleting individual occurrences until the first report for that shift is submitted. Shift times are stored in UTC. The workspace displays them and groups today's shifts in the browser's time zone, including overnight shifts that overlap today.
+
+## Local setup
+
+Use **Python 3.12** and **Node.js 22.12 or later on the Node 22 line**. Run the commands from the repository root. Scheduling, manual reports, and dashboards work without provider keys.
+
+### 1. Install dependencies and start the API
+
+In PowerShell:
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r backend/requirements.txt
-.\.venv\Scripts\python.exe -m uvicorn backend.main:app --reload
+.\.venv\Scripts\python.exe -m uvicorn backend.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-In a separate terminal, start the React app.
+On macOS or Linux, use `python3.12 -m venv .venv` and replace `.\.venv\Scripts\python.exe` with `./.venv/bin/python`.
 
-```powershell
-cd frontend
-npm install
-npm run dev
+The API creates and opens the SQLite database on startup. Check [API health](http://127.0.0.1:8000/api/health) for `{"status":"ok"}`.
+
+### 2. Start the frontend
+
+In a second terminal, from the repository root:
+
+```sh
+npm --prefix frontend ci
+npm --prefix frontend run dev
 ```
 
-Open the [public homepage](http://127.0.0.1:5173/) to see the product overview, features, and per-plant pricing. The homepage also runs with the API stopped.
+Open the [operations workspace](http://127.0.0.1:5173/app) or the [public homepage](http://127.0.0.1:5173/). Vite forwards `/api` requests to the backend on port 8000.
 
-Open the [operations app](http://127.0.0.1:5173/app) to sign in or set up the plant owner account. The Vite server proxies API requests to FastAPI on port 8000. When serving a production build, serve the frontend entry document at both `/` and `/app`.
+### 3. Set up the first plant
 
-To run the built app from a single local address, build the frontend before starting the API:
+1. Open the workspace on a trusted local connection and create the first **Plant Owner** account. New accounts require a password of at least 12 characters.
+2. As the owner, open **Departments and managers**, create a department, and add its manager.
+3. Sign in as that manager. Add a worker in **Workers**, register a machine in **Machines**, and create an assignment in **Shift assignments**. Add reporting questions if the shift needs them.
+4. Sign in as the worker and open **My shifts**. Open the assignment, enter a shift update or answer the questions directly, then save a draft or submit once the shift starts.
+5. Sign back in as the manager to review the submission and check the **Follow-up queue** in **Department overview**.
+
+## Optional voice and draft generation
+
+Create a `.env` file in the repository root and replace the placeholders for the features you want. The file is ignored by Git. The backend reads it on startup, and existing environment variables take precedence. Restart the API after changing these settings.
+
+```dotenv
+SHIFTBRIEF_VOICE_ENABLED=1
+ELEVENLABS_API_KEY=your_elevenlabs_api_key
+
+SHIFTBRIEF_AI_ENABLED=1
+GEMINI_API_KEY=your_gemini_api_key
+# Optional override for a Gemini model that supports structured output
+# SHIFTBRIEF_GEMINI_MODEL=gemini-3.1-flash-lite
+```
+
+| Feature | How it works |
+| --- | --- |
+| **Voice input** | Select the mic beside **Shift update** and stop when finished. The transcript appears in the editable update field. Recordings are limited to three minutes in the browser. Microphone access requires localhost or HTTPS and browser permission. |
+| **Generate draft** | Type or dictate an update, then select **Generate draft**. Review suggested answers, complete required questions, and add any confirmed issue details to your notes before submitting. |
+| **Submitted report analysis** | The backend saves the report first, then generates an activity summary and looks for open issues. The original report remains available if analysis fails. Eligible reports can show **Generate AI summary** or **Retry AI analysis**. |
+
+ElevenLabs Scribe v2 receives audio when a worker stops a recording. ShiftBrief does not store the recording. Gemini receives the update and assigned questions when the worker requests a draft, and receives the confirmed answers, question prompts, notes, and manual flag for submitted report analysis. Verify the provider setup with synthetic reports before sending plant data. [ElevenLabs transcription and retention settings](https://elevenlabs.io/docs/api-reference/speech-to-text/convert)
+
+## Build and serve from one address
+
+After installing the dependencies, build the frontend, stop any development API already using port 8000, then start the API again:
 
 ```powershell
 npm --prefix frontend run build
-.\.venv\Scripts\python.exe -m uvicorn backend.main:app --host 127.0.0.1
+.\.venv\Scripts\python.exe -m uvicorn backend.main:app --host 127.0.0.1 --port 8000
 ```
 
-Open [ShiftBrief operations](http://127.0.0.1:8000/app). The API serves the homepage, app, and frontend assets when `frontend/dist` is present at startup. `GET /api/health` checks that the API can read its database. Run `npm --prefix frontend test` for the shift time tests.
+Open the [built operations workspace](http://127.0.0.1:8000/app). FastAPI serves the built React assets, the public homepage, and the workspace when `frontend/dist` is present at startup.
 
-## Account setup
+## Data and checks
 
-1. Create the Plant Owner account using an email and a password of at least 12 characters.
-2. As the owner, create a department. Create a manager account with an email, an initial password, and the selected department.
-3. Sign in as the manager and create worker accounts. Workers automatically belong to the manager's department.
-4. Sign in as a worker with the credentials set by the manager.
+- The React frontend uses Vite. The FastAPI backend stores accounts, sessions, shifts, reports, and machine records in SQLite. The default database is `backend/shiftbrief.sqlite3`. Set `SHIFTBRIEF_DB` to use a different file.
+- When serving over HTTPS, keep the frontend and API on the same origin and set `SHIFTBRIEF_SECURE_COOKIE=1`. Give the database a persistent location and include it in your backup process.
+- Run `npm --prefix frontend test` for shift time tests and `npm --prefix frontend run build` to verify the frontend build.
 
-## Department operations
-
-- In **Machines**, managers can register and rename machines. Managers and workers can record a status for active machines in their department. Machines start as **Working** until the first recorded update. A condition note is required for **Not Working** or **Has Issues**. The machine list shows the three most recent updates with their dates and times. Select a machine for the full history with authors and notes. Managers can still view the history of previously archived machines.
-- In **Shift assignments**, managers can schedule a shift for one or more workers and add a description with the planned work, checks, or handover instructions. Add or edit reusable reporting questions under **Manage reporting questions** and set each selected question as required or optional. Later edits to the question library leave existing assignments intact.
-- Choose **Repeat weekly** to create individual shifts for selected weekdays in an inclusive date range of up to 366 days. An end time earlier than the start time creates an overnight shift. Each occurrence gets the same workers and reporting questions.
-- Use **Edit shift** or **Delete shift** on an individual scheduled shift, including a weekly occurrence, until its first report is submitted.
-- In **My shifts**, workers can see all assignments that overlap today, the next shift, and completed shifts. A completed shift from earlier today appears in today's schedule and in history. Workers can save one draft per assigned shift, answer its reporting questions, add optional shift notes, and manually flag an issue with an optional machine link. Submission opens at shift start and requires all mandatory answers. Submitted reports are read-only and marked late if submitted at or after the scheduled end.
-- **Department overview** shows today's shifts, per-worker reporting status, machine condition, and a searchable history with the assignment description alongside the submitted activity summary. Workers see this information in **Department handover**. Each active machine marked **Not Working** or **Has Issues** automatically appears as one open issue in the **Follow-up queue**. Further status updates keep the same machine issue open until a manager or worker records **Working**. Managers close report issues with a resolution note.
-
-## Report analysis
-
-- In **My shifts**, type one update or select **Record update**. Stop the recording and correct the transcript in the update box. **Generate draft** suggests answers for empty fields, asks about missing details, and highlights issues. Review and edit the results before submitting. Required questions still need answers. Open optional clarifications appear in the submitted report.
-- For dictation, set `SHIFTBRIEF_VOICE_ENABLED=1` and a server-side `ELEVENLABS_API_KEY`. The API reads the Git-ignored root `.env` at startup. Environment variables take precedence. Restart the API after changing these settings. Use HTTPS or localhost for microphone access. ShiftBrief sends recordings to ElevenLabs Scribe v2 and does not save audio. Review [ElevenLabs retention settings](https://elevenlabs.io/docs/api-reference/speech-to-text/convert) before enabling voice for plant data.
-- To enable AI analysis, set `SHIFTBRIEF_AI_ENABLED=1` and provide a server-side `GEMINI_API_KEY`. The default model is `gemini-3.1-flash-lite`. Set `SHIFTBRIEF_GEMINI_MODEL` to use a different Gemini model that supports structured output. Test with synthetic reports before enabling processing of plant data.
-- Gemini receives the shift update and assigned questions when a worker selects **Generate draft**. After submission it uses the confirmed answers, question prompts, notes, and any manual flag to summarize the shift and identify open problems. A report has one follow-up item that combines its manual flag and AI findings. Managers can close it with one resolution once analysis finishes. Reports and manual flags are saved immediately and remain available if analysis fails.
-- In local PowerShell, stop the API and restart it from the same terminal where you set the key. The prompt below hides the key as you enter it.
-
-  ```powershell
-  $env:SHIFTBRIEF_AI_ENABLED = '1'
-  $env:GEMINI_API_KEY = Read-Host 'Gemini API key' -MaskInput
-  .\.venv\Scripts\python.exe -m uvicorn backend.main:app --reload
-  ```
-
-- New reports with text are analyzed automatically when Gemini is enabled. For a report submitted while AI was disabled, open it and choose **Generate AI summary**. If a previous attempt failed, choose **Retry AI analysis**. The submitting worker or a manager in the same department can start this from the report view.
-- **Plant overview** compares departments and links to their read-only dashboards. The owner can browse department rosters and workers' scheduled shifts. The working machine count uses all active machines as its denominator.
-- Shift times are stored in UTC and entered and displayed in the browser's time zone. **Today** uses the browser's calendar day, including overnight shifts that overlap it. Use the device time zone shown on the assignment form when entering a shift. Use the refresh button for a new department or plant snapshot.
-
-Accounts and sessions persist in the local SQLite database at `backend/shiftbrief.sqlite3`. Set `SHIFTBRIEF_DB` before starting the API to use a different file. Sessions expire after eight hours and signing out revokes the current session.
-
-Complete the first-owner setup on a trusted local connection. If serving behind HTTPS, set `SHIFTBRIEF_SECURE_COOKIE=1` and serve the frontend and API from the same origin.
-
-See the [functional review](docs/functional-review.md) for the role workflows and known gaps before a wider rollout.
+See the [functional review](docs/functional-review.md) for operational limits and rollout considerations.
