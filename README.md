@@ -20,7 +20,9 @@ npm install
 npm run dev
 ```
 
-Open the [operations app](http://127.0.0.1:5173/) to sign in or set up the plant owner account. The Vite server proxies API requests to FastAPI on port 8000.
+Open the [public homepage](http://127.0.0.1:5173/) to see the product overview, features, and illustrative pricing. The homepage also runs with the API stopped.
+
+Open the [operations app](http://127.0.0.1:5173/app) to sign in or set up the plant owner account. The Vite server proxies API requests to FastAPI on port 8000. When serving a production build, serve the frontend entry document at both `/` and `/app`.
 
 ## Account setup
 

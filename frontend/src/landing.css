@@ -1,0 +1,174 @@
+* { box-sizing: border-box; }
+body { margin: 0; }
+
+.sb-site {
+  --ink: #101d2f;
+  --muted: #46536a;
+  --blue: #164bd8;
+  --border: #cdd5e1;
+  --gutter: clamp(1.125rem, 3.2vw, 3.5rem);
+  background: #fff;
+  color: var(--ink);
+  font: 1rem/1.55 system-ui, sans-serif;
+}
+
+.sb-site :is(h1, h2, h3, h4, p, dl, dd) { margin: 0; }
+.sb-site :is(h1, h2, h3, h4) { line-height: 1.12; letter-spacing: -.025em; }
+.sb-site a { color: inherit; }
+.sb-site a:focus-visible { outline: 3px solid currentColor; outline-offset: 4px; }
+.sb-site svg { width: 1.5rem; height: 1.5rem; flex: none; vertical-align: middle; }
+.sb-wrap { max-width: 110rem; margin-inline: auto; padding-inline: var(--gutter); }
+
+.sb-header {
+  display: flex;
+  align-items: center;
+  gap: clamp(2rem, 7vw, 7rem);
+  min-height: 5.3rem;
+}
+
+.sb-site .sb-wordmark {
+  display: inline-flex;
+  align-items: center;
+  gap: .5rem;
+  font-size: clamp(1.5rem, 3.1vw, 2.65rem);
+  font-weight: 800;
+  letter-spacing: -.055em;
+  text-decoration: none;
+}
+
+.sb-wordmark svg { color: var(--blue); width: .88em; height: .88em; }
+.sb-site nav { display: flex; flex-wrap: wrap; gap: .25rem clamp(.8rem, 3.2vw, 3rem); }
+.sb-site nav a { display: inline-block; padding-block: .45rem; font-weight: 650; text-decoration: none; }
+.sb-site nav a:hover { text-decoration: underline; text-underline-offset: .35em; }
+.sb-header nav a:hover { color: var(--blue); }
+
+.sb-hero {
+  display: grid;
+  grid-template-columns: 43% 57%;
+  min-height: clamp(32rem, 44vw, 49rem);
+  border-block: 1px solid var(--border);
+}
+
+.sb-hero-copy {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  padding: clamp(3rem, 6vw, 7rem) var(--gutter);
+}
+
+.sb-hero h1 {
+  max-width: 12ch;
+  font-size: clamp(2.7rem, 5.1vw, 5.8rem);
+  font-weight: 820;
+  letter-spacing: -.065em;
+  line-height: 1.03;
+}
+.sb-hero h1 span { display: block; }
+
+.sb-hero p { max-width: 38ch; margin-block: 1.5rem 2.15rem; font-size: clamp(1.06rem, 1.55vw, 1.55rem); }
+.sb-hero img { display: block; width: 100%; height: 100%; min-height: 0; object-fit: cover; object-position: 54% center; }
+.sb-site .sb-button {
+  display: inline-flex;
+  align-items: center;
+  gap: .75rem;
+  padding: .85rem 1.2rem;
+  background: var(--blue);
+  border-radius: .4rem;
+  color: #fff;
+  font-weight: 750;
+  text-decoration: none;
+}
+.sb-site .sb-button:hover { background: #123dad; }
+.sb-site .sb-button:focus-visible { outline-color: var(--blue); }
+
+.sb-section { padding-block: clamp(3.5rem, 6.2vw, 6.75rem); }
+.sb-section h2 { font-size: clamp(2.15rem, 4.4vw, 4.75rem); font-weight: 800; letter-spacing: -.055em; }
+.sb-site .sb-intro { margin-top: .65rem; color: var(--muted); font-size: clamp(1rem, 1.55vw, 1.4rem); }
+.sb-site .sb-label { margin-bottom: .45rem; color: var(--blue); font-size: .78rem; font-weight: 800; letter-spacing: .09em; text-transform: uppercase; }
+.sb-workflow { display: grid; grid-template-columns: 2.35fr 1fr; gap: 1.5rem; align-items: stretch; margin-block: 2rem; }
+.sb-steps, .sb-roadmap ul, .sb-plans ul { margin: 0; padding: 0; list-style: none; }
+.sb-steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1.2rem; }
+.sb-steps li { padding: .85rem .85rem .5rem 0; }
+.sb-steps li + li { border-left: 1px solid var(--border); padding-left: 1rem; }
+.sb-step-head { display: flex; gap: .65rem; align-items: center; }
+.sb-step-head span { display: grid; place-items: center; width: 2rem; height: 2rem; flex: none; border-radius: 50%; background: var(--blue); color: white; font-weight: 750; }
+.sb-step-head h3, .sb-current h3, .sb-roadmap h3 { font-size: clamp(1.15rem, 1.75vw, 1.65rem); }
+.sb-steps p, .sb-current p, .sb-roadmap p { margin-top: .5rem; color: var(--muted); }
+.sb-steps li > svg { color: var(--blue); margin-top: 1.3rem; width: 2.6rem; height: 2.6rem; }
+.sb-sample { padding: 1.1rem; background: #fff; border: 1px solid var(--border); border-radius: .8rem; box-shadow: 0 .4rem 1.2rem #101d2f0c; }
+.sb-sample-head { display: flex; align-items: center; gap: .65rem; margin-bottom: .65rem; }
+.sb-sample-head svg { color: var(--blue); }
+.sb-sample-head span { font-size: .75rem; }
+.sb-tag { margin-left: auto; padding: .18rem .5rem; border-radius: .25rem; background: #e8efff; color: #1741a5; font-weight: 700; }
+.sb-sample dl > div { padding-block: .4rem; border-top: 1px solid #e3e8ef; font-size: .84rem; }
+.sb-sample dt { font-weight: 750; }
+.sb-sample dd { color: var(--muted); }
+
+.sb-current { display: grid; grid-template-columns: .95fr 1fr 1fr; padding: 1.1rem .35rem; border: 1px solid var(--border); border-radius: .6rem; }
+.sb-current > div { display: flex; flex-wrap: wrap; align-items: center; gap: .75rem; padding: .3rem 1.1rem; }
+.sb-current > div:first-child { display: block; }
+.sb-current > div + div { flex-wrap: nowrap; border-left: 1px solid var(--border); }
+.sb-current svg, .sb-roadmap svg { color: var(--blue); }
+.sb-current svg { width: 2.1rem; height: 2.1rem; }
+.sb-current h4, .sb-roadmap h4 { font-size: 1.04rem; }
+
+.sb-roadmap { display: grid; grid-template-columns: .95fr 3fr; gap: 1.35rem; margin-top: 2rem; }
+.sb-roadmap ul { display: grid; grid-template-columns: repeat(4, 1fr); gap: .75rem; }
+.sb-roadmap li { padding: 1rem; border: 1px solid var(--border); border-radius: .55rem; }
+.sb-roadmap li svg { margin-bottom: .7rem; }
+.sb-roadmap li p, .sb-current p { font-size: .9rem; }
+
+.sb-pricing { border-top: 1px solid var(--border); }
+.sb-price-note { display: flex; align-items: center; gap: 1.1rem; padding: 1rem 1.2rem; margin-block: 1.55rem; border: 1px solid var(--border); border-radius: .55rem; }
+.sb-price-note svg, .sb-price-note strong { color: var(--blue); }
+.sb-price-note strong { font-size: 1.15rem; }
+.sb-price-note p { color: var(--muted); }
+.sb-plans { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1.15rem; }
+.sb-plan { overflow: hidden; border: 1px solid var(--border); border-radius: .65rem; }
+.sb-plan-highlight { border-color: var(--blue); box-shadow: inset 0 0 0 1px var(--blue); }
+.sb-plan-head, .sb-plan-body { padding: 1rem clamp(1rem, 2.05vw, 2.25rem); }
+.sb-plan-head { min-height: 6.4rem; }
+.sb-plan-head h3 { font-size: clamp(1.65rem, 2.5vw, 2.65rem); }
+.sb-plan-head p { margin-top: .35rem; }
+.sb-plan-highlight .sb-plan-head { background: var(--blue); color: #fff; }
+.sb-plan-body .sb-price { padding-bottom: .8rem; margin-bottom: .85rem; border-bottom: 1px solid var(--border); }
+.sb-price strong { color: var(--blue); font-size: clamp(2.2rem, 3.45vw, 3.7rem); line-height: 1; letter-spacing: -.055em; }
+.sb-price span { color: var(--muted); }
+.sb-plan li { display: flex; align-items: flex-start; gap: .6rem; margin-bottom: .6rem; }
+.sb-plan li svg { color: var(--blue); width: 1.1rem; height: 1.1rem; margin-top: .2rem; }
+.sb-footer { background: var(--ink); color: #fff; }
+.sb-footer .sb-wrap { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: .65rem 1.25rem; padding-block: 1.15rem; }
+.sb-footer .sb-wordmark { font-size: 1.55rem; }
+.sb-footer svg { color: inherit; }
+
+@media (max-width: 72rem) {
+  .sb-roadmap { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 55rem) {
+  .sb-hero { grid-template-columns: 1fr 1fr; min-height: 0; }
+  .sb-hero-copy { padding-block: 2.6rem; }
+  .sb-workflow { grid-template-columns: 1fr; }
+  .sb-roadmap ul { grid-template-columns: repeat(2, 1fr); }
+}
+
+@media (max-width: 40rem) {
+  .sb-header { min-height: 0; justify-content: space-between; flex-wrap: wrap; gap: .15rem .85rem; padding-block: .65rem; }
+  .sb-header nav { font-size: .9rem; }
+  .sb-hero { grid-template-columns: 1fr; }
+  .sb-hero h1 { max-width: 14ch; }
+  .sb-hero img { height: auto; aspect-ratio: 4 / 3; }
+  .sb-steps, .sb-current, .sb-plans { grid-template-columns: 1fr; }
+  .sb-steps { gap: 0; }
+  .sb-steps li { padding: .8rem 0; }
+  .sb-steps li + li { border-left: 0; border-top: 1px solid var(--border); padding-left: 0; }
+  .sb-steps li > svg { display: none; }
+  .sb-current > div { padding-block: .8rem; }
+  .sb-current > div + div { border-left: 0; border-top: 1px solid var(--border); }
+  .sb-plan-head { min-height: 0; }
+}
+
+@media (max-width: 25rem) {
+  .sb-roadmap ul { grid-template-columns: 1fr; }
+}
