@@ -95,3 +95,40 @@ Open the [built operations workspace](http://127.0.0.1:8000/app). FastAPI serves
 - Run `npm --prefix frontend test` for shift time tests and `npm --prefix frontend run build` to verify the frontend build.
 
 See the [functional review](docs/functional-review.md) for operational limits and rollout considerations.
+
+## Heroku and Supabase deployment
+
+Create a restricted Postgres login role named `shiftbrief_runtime`. Keep the
+database owner URI in local `SHIFTBRIEF_MIGRATION_DATABASE_URL` and set
+`SHIFTBRIEF_DATABASE_URL` on Heroku to the runtime login URI. Require TLS on both
+connections. The Supabase HTTP API keys are separate from these Postgres logins.
+
+Add `--dry-run` to roll back the import after verification. At cutover, stop local writes,
+retain a backup, then run this from the repository root:
+
+```powershell
+.\.venv\Scripts\python.exe -m backend.migrate --runtime-role shiftbrief_runtime --import-sqlite backend/shiftbrief.sqlite3
+```
+
+The import requires an empty ShiftBrief schema and a local Plant Owner account.
+It preserves password hashes and business records, drops old sessions, and
+marks pending analysis jobs unavailable for manual retry. The local file is
+opened read-only.
+
+Set `SHIFTBRIEF_HOSTED=1`, `SHIFTBRIEF_SECURE_COOKIE=1`, the two feature flags,
+and the Gemini and ElevenLabs keys as Heroku Config Vars. On a Cedar app
+using the container stack, Heroku builds the image using `heroku.yml`.
+Deploy the tested commit with an authenticated Heroku CLI session:
+
+```powershell
+$appName = '<app-name>'
+heroku git:remote --app $appName --remote shiftbrief-heroku
+git push shiftbrief-heroku HEAD:main
+heroku ps:scale web=1 worker=1 --app $appName
+heroku ps --app $appName
+```
+
+Check the hosted health endpoint and sign in with the imported owner account.
+Try Gemini and voice with synthetic reports. Gemini draft generation and report
+analysis use the Postgres-backed worker. Transcription keeps audio in memory and
+times out before Heroku's request limit.

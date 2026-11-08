@@ -1,0 +1,13 @@
+build:
+  docker:
+    web: Dockerfile
+release:
+  image: web
+  command:
+    - python -m backend.worker --check
+run:
+  web: exec python -m uvicorn backend.main:app --host 0.0.0.0 --port "$PORT"
+  worker:
+    image: web
+    command:
+      - python -m backend.worker

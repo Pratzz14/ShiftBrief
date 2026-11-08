@@ -19,6 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import AwareDatetime, BaseModel, ConfigDict, EmailStr, Field, StringConstraints, model_validator
 
 from . import automation
+from .database import DATABASE_URL, HOSTED, IntegrityError, Postgres, begin_write, insert_id
 
 DATABASE = Path(os.getenv("SHIFTBRIEF_DB", Path(__file__).with_name("shiftbrief.sqlite3")))
 FRONTEND = Path(__file__).resolve().parents[1] / "frontend" / "dist"
@@ -120,7 +121,11 @@ CREATE TABLE IF NOT EXISTS report_resolutions (
 """
 
 
-def connect() -> sqlite3.Connection:
+def connect() -> sqlite3.Connection | Postgres:
+    if DATABASE_URL:
+        return Postgres(DATABASE_URL)
+    if HOSTED:
+        raise RuntimeError("Hosted ShiftBrief requires SHIFTBRIEF_DATABASE_URL.")
     connection = sqlite3.connect(DATABASE, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
@@ -129,6 +134,12 @@ def connect() -> sqlite3.Connection:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    if HOSTED or DATABASE_URL:
+        with closing(connect()) as connection:
+            if not connection.execute("SELECT 1 FROM schema_version WHERE version = 1").fetchone():
+                raise RuntimeError("ShiftBrief Postgres migration is required.")
+        yield
+        return
     with closing(connect()) as connection:
         connection.executescript(automation.SCHEMA)
         connection.executescript(SCHEMA)
@@ -202,12 +213,12 @@ async def invalid_input(_: Request, exc: RequestValidationError):
     return JSONResponse({"detail": errors}, status_code=422)
 
 
-def get_db() -> Iterator[sqlite3.Connection]:
+def get_db() -> Iterator[sqlite3.Connection | Postgres]:
     with closing(connect()) as connection:
         yield connection
 
 
-DB = Annotated[sqlite3.Connection, Depends(get_db)]
+DB = Annotated[sqlite3.Connection | Postgres, Depends(get_db)]
 
 
 class Login(BaseModel):
@@ -262,18 +273,18 @@ def insert_account(db: DB, data: NewAccount, role: Role, department_id: int | No
     stored_hash = f"{salt.hex()}:{password_digest(data.password, salt)}"
     try:
         with db:
-            cursor = db.execute(
+            created_id = insert_id(db,
                 """INSERT INTO accounts(email, password_hash, role, department_id, display_name)
                    VALUES (?, ?, ?, ?, ?)""",
                 (data.email.casefold(), stored_hash, role, department_id, data.display_name or None),
             )
-    except sqlite3.IntegrityError as exc:
+    except IntegrityError as exc:
         if role == "owner" and owner_exists(db):
             raise HTTPException(409, "The plant owner account already exists.") from exc
-        if exc.sqlite_errorname == "SQLITE_CONSTRAINT_UNIQUE":
+        if getattr(exc, "sqlite_errorname", None) == "SQLITE_CONSTRAINT_UNIQUE" or getattr(exc, "sqlstate", None) == "23505":
             raise HTTPException(409, "An account already uses that email.") from exc
         raise
-    return dict(db.execute(ACCOUNT_QUERY + " WHERE accounts.id = ?", (cursor.lastrowid,)).fetchone())
+    return dict(db.execute(ACCOUNT_QUERY + " WHERE accounts.id = ?", (created_id,)).fetchone())
 
 
 def token_digest(token: str) -> str:
@@ -339,11 +350,13 @@ def owner_exists(db: DB) -> bool:
 
 @app.get("/api/auth/setup")
 def setup_status(db: DB) -> dict[str, bool]:
-    return {"owner_exists": owner_exists(db)}
+    return {"owner_exists": HOSTED or owner_exists(db)}
 
 
 @app.post("/api/auth/signup", response_model=Account, status_code=201)
 def signup(data: NewAccount, request: Request, response: Response, db: DB):
+    if HOSTED:
+        raise HTTPException(403, "Public owner registration is disabled.")
     if owner_exists(db):
         raise HTTPException(409, "The plant owner account already exists.")
     account = insert_account(db, data, "owner", None)
@@ -390,12 +403,12 @@ def departments(db: DB, _: Owner) -> list[Department]:
 def create_department(data: DepartmentName, db: DB, _: Owner) -> Department:
     try:
         with db:
-            cursor = db.execute("INSERT INTO departments(name) VALUES (?)", (data.name,))
-    except sqlite3.IntegrityError as exc:
-        if exc.sqlite_errorname == "SQLITE_CONSTRAINT_UNIQUE":
+            created_id = insert_id(db, "INSERT INTO departments(name) VALUES (?)", (data.name,))
+    except IntegrityError as exc:
+        if getattr(exc, "sqlite_errorname", None) == "SQLITE_CONSTRAINT_UNIQUE" or getattr(exc, "sqlstate", None) == "23505":
             raise HTTPException(409, "That department already exists.") from exc
         raise
-    return Department(id=cursor.lastrowid, name=data.name)
+    return Department(id=created_id, name=data.name)
 
 
 @app.post("/api/managers", response_model=Account, status_code=201)
@@ -515,7 +528,7 @@ def list_machines(db: DB, account: DepartmentStaff) -> list[MachineListItem]:
         machines = [
             MachineListItem(**machine_from_row(row).model_dump())
             for row in db.execute(
-                MACHINE_QUERY + scope + " ORDER BY m.archived, m.name COLLATE NOCASE, m.id", params,
+                MACHINE_QUERY + scope + " ORDER BY m.archived, lower(m.name), m.id", params,
             )
         ]
         by_id = {machine.id: machine for machine in machines}
@@ -535,11 +548,11 @@ def list_machines(db: DB, account: DepartmentStaff) -> list[MachineListItem]:
 @app.post("/api/machines", status_code=201)
 def register_machine(data: MachineName, db: DB, account: Manager) -> MachineListItem:
     with db:
-        cursor = db.execute(
+        created_id = insert_id(db,
             "INSERT INTO machines (department_id, name) VALUES (?, ?)",
             (account.department_id, data.name),
         )
-    return MachineListItem(id=cursor.lastrowid, name=data.name, archived=False, latest=None)
+    return MachineListItem(id=created_id, name=data.name, archived=False, latest=None)
 
 
 @app.get("/api/machines/{machine_id}")
@@ -581,18 +594,18 @@ def record_machine_update(
     machine_id: int, data: MachineUpdateInput, db: DB, account: DepartmentStaff,
 ) -> MachineUpdate:
     with db:
-        db.execute("BEGIN IMMEDIATE")
+        begin_write(db)
         recorded_at = datetime.now(UTC)
-        result = db.execute(
+        created_id = insert_id(db,
             """INSERT INTO machine_updates (machine_id, worker_id, status, note, recorded_at)
                SELECT id, ?, ?, ?, ? FROM machines
                WHERE id = ? AND department_id = ? AND archived = 0""",
             (account.id, data.status, data.note, recorded_at.isoformat(), machine_id, account.department_id),
         )
-        if not result.rowcount:
+        if created_id is None:
             raise HTTPException(404, "Active machine not found.")
     return MachineUpdate(
-        id=result.lastrowid, **data.model_dump(), worker_email=account.email, recorded_at=recorded_at,
+        id=created_id, **data.model_dump(), worker_email=account.email, recorded_at=recorded_at,
     )
 
 
@@ -691,11 +704,11 @@ def reporting_questions(db: DB, account: Manager) -> list[Question]:
 @app.post("/api/reporting-questions", status_code=201)
 def create_reporting_question(data: QuestionInput, db: DB, account: Manager) -> Question:
     with db:
-        cursor = db.execute(
+        created_id = insert_id(db,
             "INSERT INTO reporting_questions (department_id, prompt, required) VALUES (?, ?, ?)",
-            (account.department_id, data.prompt, data.required),
+            (account.department_id, data.prompt, int(data.required)),
         )
-    return Question(id=cursor.lastrowid, **data.model_dump())
+    return Question(id=created_id, **data.model_dump())
 
 
 @app.patch("/api/reporting-questions/{question_id}")
@@ -703,7 +716,7 @@ def edit_reporting_question(question_id: int, data: QuestionInput, db: DB, accou
     with db:
         cursor = db.execute(
             "UPDATE reporting_questions SET prompt = ?, required = ? WHERE id = ? AND department_id = ?",
-            (data.prompt, data.required, question_id, account.department_id),
+            (data.prompt, int(data.required), question_id, account.department_id),
         )
         if not cursor.rowcount:
             raise HTTPException(404, "Reporting question not found.")
@@ -716,7 +729,7 @@ def save_assignments(
 ) -> list[Shift]:
     shifts = []
     with db:
-        db.execute("BEGIN IMMEDIATE")
+        begin_write(db)
         saved_questions = []
         if existing_id is not None:
             existing = find_department_shift(existing_id, db, account)
@@ -760,11 +773,11 @@ def save_assignments(
                 data.description,
             )
             if existing_id is None:
-                cursor = db.execute(
+                created_id = insert_id(db,
                     "INSERT INTO shifts (department_id, starts_at, ends_at, questions, description) VALUES (?, ?, ?, ?, ?)",
                     (account.department_id, *values),
                 )
-                shift_id = cursor.lastrowid
+                shift_id = created_id
             else:
                 shift_id = existing_id
                 db.execute(
@@ -840,7 +853,7 @@ def edit_shift(shift_id: int, data: NewShift, db: DB, account: Manager) -> Shift
 @app.delete("/api/shifts/{shift_id}", status_code=204)
 def delete_shift(shift_id: int, db: DB, account: Manager) -> None:
     with db:
-        db.execute("BEGIN IMMEDIATE")
+        begin_write(db)
         require_unsubmitted_shift(find_department_shift(shift_id, db, account))
         db.execute("DELETE FROM shift_reports WHERE shift_id = ?", (shift_id,))
         db.execute("INSERT INTO deleted_shifts (shift_id) VALUES (?)", (shift_id,))
@@ -1018,6 +1031,17 @@ def generate_worker_draft(shift_id: int, data: GenerateDraftInput, db: DB, worke
     shift, _ = editable_report(shift_id, data.revision, db, worker)
     if not automation.ANALYSIS_ENABLED:
         raise HTTPException(503, "AI draft generation is disabled. You can enter answers manually.")
+    if isinstance(db, Postgres):
+        with db:
+            begin_write(db)
+            shift, _ = editable_report(shift_id, data.revision, db, worker)
+            job_id = insert_id(db, """
+                INSERT INTO draft_jobs (shift_id, worker_id, revision, payload, expires_at)
+                VALUES (?, ?, ?, ?, ?)
+                """, (shift_id, worker.id, data.revision,
+                      json.dumps({"update": data.worker_update, "questions": json.loads(shift["questions"])}),
+                      time.time() + 600))
+        return JSONResponse({"job_id": job_id}, status_code=202)
     try:
         draft = automation.generate_draft(data.worker_update, json.loads(shift["questions"]))
     except Exception as error:
@@ -1025,6 +1049,20 @@ def generate_worker_draft(shift_id: int, data: GenerateDraftInput, db: DB, worke
         raise HTTPException(502, "Could not generate a draft. Try again or enter answers manually.") from None
     editable_report(shift_id, data.revision, db, worker)
     return draft
+
+
+@app.get("/api/shifts/{shift_id}/report/draft-jobs/{job_id}")
+def draft_job(shift_id: int, job_id: int, db: DB, worker: Worker) -> dict:
+    if not isinstance(db, Postgres):
+        raise HTTPException(404, "Draft job not found.")
+    job = db.execute("""
+        SELECT revision, state, result FROM draft_jobs
+        WHERE id = ? AND shift_id = ? AND worker_id = ? AND expires_at > ?
+        """, (job_id, shift_id, worker.id, time.time())).fetchone()
+    if job is None:
+        raise HTTPException(404, "Draft job not found.")
+    editable_report(shift_id, job["revision"], db, worker)
+    return {"state": job["state"], "result": json.loads(job["result"]) if job["result"] else None}
 
 
 @app.post("/api/shifts/{shift_id}/report/transcribe")
@@ -1035,6 +1073,26 @@ async def transcribe_worker_update(shift_id: int, revision: str, request: Reques
     media_type = request.headers.get("content-type", "").partition(";")[0].strip().lower()
     if media_type not in automation.AUDIO_EXTENSIONS:
         raise HTTPException(415, "Unsupported recording format. You can type your shift update.")
+    try:
+        async with asyncio.timeout(25):
+            audio = await read_recording(request)
+            editable_report(shift_id, revision, db, worker)
+            try:
+                transcript = await automation.transcribe_audio(audio, media_type)
+            except Exception as error:
+                logger.warning("Shift report transcription failed (%s)", type(error).__name__)
+                raise HTTPException(502, "Could not transcribe the recording. Retry or type your shift update.") from None
+    except TimeoutError:
+        raise HTTPException(504, "Transcription timed out. Retry with a shorter recording or type your update.") from None
+    editable_report(shift_id, revision, db, worker)
+    if not transcript:
+        raise HTTPException(422, "No speech was detected. Record again or type your update.")
+    if len(transcript) > MAX_UPDATE_LENGTH:
+        raise HTTPException(422, "The transcript is too long. Record a shorter update.")
+    return {"text": transcript}
+
+
+async def read_recording(request: Request) -> bytes:
     audio = bytearray()
     async for chunk in request.stream():
         if len(audio) + len(chunk) > MAX_AUDIO_BYTES:
@@ -1042,18 +1100,7 @@ async def transcribe_worker_update(shift_id: int, revision: str, request: Reques
         audio.extend(chunk)
     if not audio:
         raise HTTPException(422, "The recording is empty.")
-    editable_report(shift_id, revision, db, worker)
-    try:
-        transcript = await asyncio.to_thread(automation.transcribe_audio, bytes(audio), media_type)
-    except Exception as error:
-        logger.warning("Shift report transcription failed (%s)", type(error).__name__)
-        raise HTTPException(502, "Could not transcribe the recording. Retry or type your shift update.") from None
-    editable_report(shift_id, revision, db, worker)
-    if not transcript:
-        raise HTTPException(422, "No speech was detected. Record again or type your update.")
-    if len(transcript) > MAX_UPDATE_LENGTH:
-        raise HTTPException(422, "Transcript is too long. Record a shorter update.")
-    return {"text": transcript}
+    return bytes(audio)
 
 
 def queue_missing_analysis(db: DB, shift: sqlite3.Row, worker_id: int) -> dict:
@@ -1078,14 +1125,14 @@ def queue_missing_analysis(db: DB, shift: sqlite3.Row, worker_id: int) -> dict:
 @app.post("/api/shifts/{shift_id}/report/analyze")
 def analyze_worker_report(shift_id: int, db: DB, worker: Worker) -> dict:
     with db:
-        db.execute("BEGIN IMMEDIATE")
+        begin_write(db)
         return queue_missing_analysis(db, assigned_shift(shift_id, db, worker), worker.id)
 
 
 def save_report(shift_id: int, data: ReportInput, db: DB, worker: Worker, *, submit: bool) -> dict:
     now = datetime.now(UTC)
     with db:
-        db.execute("BEGIN IMMEDIATE")
+        begin_write(db)
         shift, existing = editable_report(shift_id, data.revision, db, worker)
         questions = {question["id"]: question for question in json.loads(shift["questions"])}
         if data.answers.keys() - questions.keys():
@@ -1130,7 +1177,7 @@ def save_report(shift_id: int, data: ReportInput, db: DB, worker: Worker, *, sub
                  late = excluded.late, analysis_job_id = excluded.analysis_job_id""",
             (shift_id, worker.id, json.dumps(data.answers), data.notes, worker_update, json.dumps(clarifications),
              data.issue, data.machine_id,
-             now.isoformat() if submit else None, submit and now >= datetime.fromisoformat(shift["ends_at"]),
+             now.isoformat() if submit else None, int(submit and now >= datetime.fromisoformat(shift["ends_at"])),
              analysis_job_id),
         )
         return report_content(db, shift, worker.id)
@@ -1181,7 +1228,7 @@ def review_report(department_id: int, shift_id: int, worker_id: int, db: DB, acc
 @app.post("/api/reports/{shift_id}/{worker_id}/analyze")
 def analyze_department_report(shift_id: int, worker_id: int, db: DB, manager: Manager) -> dict:
     with db:
-        db.execute("BEGIN IMMEDIATE")
+        begin_write(db)
         shift = submitted_report(db, shift_id, worker_id)
         if shift["department_id"] != manager.department_id:
             raise HTTPException(404, "Submitted report not found.")
@@ -1191,7 +1238,7 @@ def analyze_department_report(shift_id: int, worker_id: int, db: DB, manager: Ma
 @app.post("/api/reports/{shift_id}/{worker_id}/resolve", status_code=204)
 def resolve_report_issue(shift_id: int, worker_id: int, data: ResolutionInput, db: DB, manager: Manager) -> None:
     with db:
-        db.execute("BEGIN IMMEDIATE")
+        begin_write(db)
         shift = submitted_report(db, shift_id, worker_id)
         if shift["department_id"] != manager.department_id or not (shift["issue"] or json.loads(shift["ai_findings"])):
             raise HTTPException(404, "Report issue not found.")
@@ -1223,16 +1270,16 @@ def department_metrics(db: DB, department_ids: list[int], now: datetime) -> dict
         """SELECT m.department_id, COALESCE(u.status, 'Working') AS status, COUNT(*) AS total
            FROM machines m LEFT JOIN machine_updates u ON u.id = (
              SELECT id FROM machine_updates WHERE machine_id = m.id ORDER BY id DESC LIMIT 1
-           ) WHERE m.archived = 0 AND m.department_id""" + scope + " GROUP BY m.department_id, status",
+           ) WHERE m.archived = 0 AND m.department_id""" + scope + " GROUP BY m.department_id, COALESCE(u.status, 'Working')",
         params,
     ):
         metrics[row["department_id"]]["machines"][row["status"]] = row["total"]
     stamp = now.isoformat(timespec="microseconds")
     for row in db.execute(
         """SELECT s.department_id,
-                  SUM(r.submitted_at IS NULL AND s.starts_at <= ? AND s.ends_at > ?) AS due,
-                  SUM(r.submitted_at IS NULL AND s.ends_at <= ?) AS overdue,
-                  SUM(r.submitted_at IS NOT NULL AND (r.issue != '' OR r.ai_findings != '[]')
+                  COUNT(*) FILTER (WHERE r.submitted_at IS NULL AND s.starts_at <= ? AND s.ends_at > ?) AS due,
+                  COUNT(*) FILTER (WHERE r.submitted_at IS NULL AND s.ends_at <= ?) AS overdue,
+                  COUNT(*) FILTER (WHERE r.submitted_at IS NOT NULL AND (r.issue != '' OR r.ai_findings != '[]')
                       AND rr.shift_id IS NULL) AS report_issues
            FROM shifts s JOIN shift_workers sw ON sw.shift_id = s.id
            LEFT JOIN shift_reports r ON r.shift_id = s.id AND r.worker_id = sw.worker_id
@@ -1279,7 +1326,7 @@ def department_roster(department_id: int, db: DB, owner: Owner) -> list[dict]:
                  AND NOT EXISTS (SELECT 1 FROM deleted_shifts WHERE shift_id = s.id)
            ) scheduled ON scheduled.worker_id = a.id
            WHERE a.role = 'worker' AND a.department_id = ?
-           ORDER BY COALESCE(a.display_name, a.email) COLLATE NOCASE, a.id,
+           ORDER BY lower(COALESCE(a.display_name, a.email)), a.id,
                     scheduled.starts_at, scheduled.shift_id""",
         (department_id, stamp, department_id),
     )

@@ -5,15 +5,13 @@ import os
 import secrets
 import time
 from contextlib import closing
-from pathlib import Path
 from typing import Annotated
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
-from dotenv import load_dotenv
-from pydantic import BaseModel, ConfigDict, Field, WithJsonSchema
+from .database import Postgres, begin_write, insert_id
 
-load_dotenv(Path(__file__).resolve().parents[1] / ".env", interpolate=False)
+from pydantic import BaseModel, ConfigDict, Field, WithJsonSchema
 
 
 SCHEMA = """
@@ -162,28 +160,26 @@ def generate_draft(update: str, questions: list[dict]) -> dict:
     }
 
 
-def transcribe_audio(audio: bytes, media_type: str) -> str:
-    boundary = secrets.token_hex(24)
+async def transcribe_audio(audio: bytes, media_type: str) -> str:
+    import httpx
+
     extension = AUDIO_EXTENSIONS[media_type]
-    header = (
-        f"--{boundary}\r\nContent-Disposition: form-data; name=\"model_id\"\r\n\r\nscribe_v2\r\n"
-        f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"shift.{extension}\"\r\n"
-        f"Content-Type: {media_type}\r\n\r\n"
-    )
-    request = Request(
-        "https://api.elevenlabs.io/v1/speech-to-text",
-        data=header.encode() + audio + f"\r\n--{boundary}--\r\n".encode(),
-        headers={"Content-Type": f"multipart/form-data; boundary={boundary}", "xi-api-key": ELEVENLABS_KEY},
-    )
-    with urlopen(request, timeout=45) as response:
-        return json.load(response)["text"].strip()
+    async with httpx.AsyncClient(timeout=23) as client:
+        response = await client.post(
+            "https://api.elevenlabs.io/v1/speech-to-text",
+            data={"model_id": "scribe_v2"},
+            files={"file": (f"shift.{extension}", audio, media_type)},
+            headers={"xi-api-key": ELEVENLABS_KEY},
+        )
+        response.raise_for_status()
+        return response.json()["text"].strip()
 
 
 def enqueue(db, payload: dict) -> int:
-    return db.execute(
+    return insert_id(db,
         "INSERT INTO automation_jobs (kind, payload) VALUES ('analysis', ?)",
         (json.dumps(payload, ensure_ascii=False),),
-    ).lastrowid
+    )
 
 
 def process_one(connect) -> bool:
@@ -191,7 +187,8 @@ def process_one(connect) -> bool:
         now = time.time()
         claim = secrets.token_hex(16)
         with db:
-            db.execute("BEGIN IMMEDIATE")
+            if not isinstance(db, Postgres):
+                begin_write(db)
             db.execute(
                 """UPDATE automation_jobs SET state = 'unavailable', payload = '', claim = NULL
                    WHERE kind = 'analysis' AND state = 'pending' AND ready_at <= ? AND attempts >= ?""",
@@ -200,7 +197,8 @@ def process_one(connect) -> bool:
             job = db.execute(
                 """SELECT id, payload, attempts FROM automation_jobs
                    WHERE kind = 'analysis' AND state = 'pending' AND ready_at <= ?
-                   ORDER BY ready_at, id LIMIT 1""",
+                   ORDER BY ready_at, id LIMIT 1"""
+                + (" FOR UPDATE SKIP LOCKED" if isinstance(db, Postgres) else ""),
                 (now,),
             ).fetchone()
             if job is None:
@@ -242,8 +240,47 @@ def process_one(connect) -> bool:
 async def run_jobs(connect) -> None:
     while True:
         try:
-            if await asyncio.to_thread(process_one, connect):
+            analysis = await asyncio.to_thread(process_one, connect)
+            if await asyncio.to_thread(process_draft, connect) or analysis:
                 continue
         except Exception as error:
             logger.error("ShiftBrief analysis queue error (%s)", type(error).__name__)
         await asyncio.sleep(1)
+
+
+def process_draft(connect) -> bool:
+    with closing(connect()) as db:
+        if not isinstance(db, Postgres):
+            return False
+        now = time.time()
+        claim = secrets.token_hex(16)
+        with db:
+            db.execute("DELETE FROM draft_jobs WHERE expires_at <= ?", (now,))
+            db.execute("""
+                UPDATE draft_jobs SET state = 'unavailable', payload = '', claim = NULL
+                WHERE state = 'pending' AND ready_at <= ? AND attempts >= ?
+                """, (now, MAX_ATTEMPTS))
+            job = db.execute("""
+                SELECT id, payload, attempts FROM draft_jobs
+                WHERE state = 'pending' AND ready_at <= ?
+                ORDER BY ready_at, id LIMIT 1 FOR UPDATE SKIP LOCKED
+                """, (now,)).fetchone()
+            if job is None:
+                return False
+            attempt = job["attempts"] + 1
+            db.execute("UPDATE draft_jobs SET ready_at = ?, claim = ?, attempts = ? WHERE id = ?",
+                       (now + LEASE_SECONDS, claim, attempt, job["id"]))
+
+        try:
+            result = json.dumps(generate_draft(**json.loads(job["payload"])))
+            state = "complete"
+        except Exception as error:
+            logger.warning("ShiftBrief draft job %s failed (%s)", job["id"], type(error).__name__)
+            result = None
+            state = "unavailable" if attempt >= MAX_ATTEMPTS else "pending"
+        db.execute("""
+            UPDATE draft_jobs SET state = ?, result = ?, claim = NULL, ready_at = ?,
+                payload = CASE WHEN ? = 'pending' THEN payload ELSE '' END
+            WHERE id = ? AND claim = ?
+            """, (state, result, time.time() + 5 * attempt, state, job["id"], claim))
+        return True

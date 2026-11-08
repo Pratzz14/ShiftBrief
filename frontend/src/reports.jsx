@@ -302,8 +302,19 @@ export function WorkerReport({ shiftId, onExpired, onSave }) {
   if (!machines.data) return <LoadState resource={machines} label="machines" />;
   return (
     <ReportEditor key={report.data.revision} report={report.data} machines={machines.data} onReload={report.retry}
-      generateDraft={report.data.draft_generation_enabled ? (worker_update) =>
-        write(path + '/generate-draft', 'POST', { revision: report.data.revision, worker_update }, onExpired) : null}
+      generateDraft={report.data.draft_generation_enabled ? async (worker_update) => {
+        const response = await write(path + '/generate-draft', 'POST',
+          { revision: report.data.revision, worker_update }, onExpired);
+        if (!response.job_id) return response;
+        const deadline = Date.now() + 300000;
+        while (Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 2000));
+          const job = await write(path + '/draft-jobs/' + response.job_id, 'GET', undefined, onExpired);
+          if (job.state === 'complete') return job.result;
+          if (job.state === 'unavailable') break;
+        }
+        throw new Error('Could not generate a draft. Try again or enter answers manually.');
+      } : null}
       transcribe={report.data.voice_enabled ? (audio) =>
         write(path + '/transcribe?revision=' + encodeURIComponent(report.data.revision), 'POST', audio, onExpired) : null}
       onSave={async (data, submit) => {
